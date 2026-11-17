@@ -1,20 +1,28 @@
 -- Draws the recorded paths as a heatmap on the world map.
 -- Yellow = walked rarely, orange/red = walked often, blue = only ever fallen down,
 -- purple = only walked during/just after combat (grinding, not travelling).
+--
+-- Performance: recorded connections are 8 yards long, so a zone holds thousands of them.
+-- Drawing each as its own Line makes panning/zooming the map slow, so connections are first
+-- joined into chains (through cells with exactly two connections of the same colour) and those
+-- chains are simplified (Douglas-Peucker) before drawing. Straight roads become a few lines.
 
 local ADDON, ns = ...
 local HBD = LibStub("HereBeDragons-2.0")
 
 local THICKNESS = 2.5     -- line width in screen pixels (corrected for zoom)
-local MAX_LINES = 15000
+local MAX_LINES = 6000
 local FRAME_LEVEL = 2010  -- just below Questie's icons (2015+)
-local REDRAW_INTERVAL = 2 -- seconds: with the map open, redraw for new data at most this often
+local REDRAW_INTERVAL = 5 -- seconds: with the map open, redraw for new data at most this often
+local SIMPLIFY = 1.0      -- max deviation in canvas units (~screen pixels) when simplifying chains
+local HEAT_STEPS = 5      -- heat colours are bucketed so chains can be joined
+local ZOOM_DRIFT = 0.25   -- restyle mid-zoom only when line width drifts this far
 
-local log, min = math.log, math.min
+local log, min, max, floor = math.log, math.min, math.max, math.floor
 
 local overlay
 local lines, used = {}, 0
-local shownMap, shownW, shownH, shownScale, shownRev
+local shownMap, shownW, shownH, shownScale, shownRev, lastScale
 local sinceDraw = 0
 
 -- Cache split edge keys
@@ -60,10 +68,54 @@ local function Heat(key)
     return h
 end
 
-local function HeatColor(heat)
+-- Colour classes: 0..HEAT_STEPS = heat buckets, "drop", "fight".
+local function HeatBucket(heat)
     -- 1 pass = yellow, 2 = orange, ~6+ = red
-    local t = min(1, log(math.max(1, heat)) / log(6))
+    local t = min(1, log(max(1, heat)) / log(6))
+    return floor(t * HEAT_STEPS + 0.5)
+end
+
+local function ClassColor(cls)
+    if cls == "drop" then return 0.4, 0.7, 1, 0.8 end
+    if cls == "fight" then return 0.75, 0.4, 1, 0.55 end
+    local t = cls / HEAT_STEPS
     return 1, 1 - 0.9 * t, 0.2 - 0.2 * t, 0.6 + 0.35 * t
+end
+
+-- Douglas-Peucker on parallel x/y arrays; returns the kept indices in order.
+local function Simplify(xs, ys, tol)
+    local n = #xs
+    if n <= 2 then return {1, n} end
+    local keep = {[1] = true, [n] = true}
+    local stack = {1, n}
+    local tol2 = tol * tol
+    while #stack > 0 do
+        local last = stack[#stack]; stack[#stack] = nil
+        local first = stack[#stack]; stack[#stack] = nil
+        local x1, y1, x2, y2 = xs[first], ys[first], xs[last], ys[last]
+        local dx, dy = x2 - x1, y2 - y1
+        local len2 = dx * dx + dy * dy
+        local worst, worstD = nil, tol2
+        for i = first + 1, last - 1 do
+            local px, py = xs[i] - x1, ys[i] - y1
+            local d
+            if len2 == 0 then
+                d = px * px + py * py
+            else
+                local cross = px * dy - py * dx
+                d = cross * cross / len2
+            end
+            if d > worstD then worst, worstD = i, d end
+        end
+        if worst then
+            keep[worst] = true
+            stack[#stack + 1] = first; stack[#stack + 1] = worst
+            stack[#stack + 1] = worst; stack[#stack + 1] = last
+        end
+    end
+    local out = {}
+    for i = 1, n do if keep[i] then out[#out + 1] = i end end
+    return out
 end
 
 local function Redraw()
@@ -76,48 +128,120 @@ local function Redraw()
     shownMap, shownW, shownH, shownScale, shownRev = mapID, width, height, scale, ns.rev
     sinceDraw = 0
 
-    if PadvinderDB.showMap and data and data[1] ~= 0 and data[2] ~= 0 and width > 0 then
+    local w = data and PadvinderDB.worlds[data.instance]
+    if PadvinderDB.showMap and w and data[1] ~= 0 and data[2] ~= 0 and width > 0 then
         local zw, zh, left, top = data[1], data[2], data[3], data[4]
-        local w = PadvinderDB.worlds[data.instance]
-        if w then
-            local edges, drops, fight = w.edges, w.drops, w.fight
-            local thick = THICKNESS / scale
-            local mode = PadvinderDB.mapMode
-            -- heat from travel only: cell visits minus the ones made while fighting
-            local cells, fightCells = w.cells, w.fightCells
-            heatCache = {}
-            heatCells = setmetatable({}, {__index = function(_, k)
-                local c = cells[k]
-                return c and (c - (fightCells[k] or 0)) or nil
-            end})
-            for ek, count in pairs(edges) do
-                local a, b = Split(ek)
-                local rk = b .. ">" .. a
-                local reverse = edges[rk]
+        local edges, drops, fight = w.edges, w.drops, w.fight
+        local mode = PadvinderDB.mapMode
+        -- heat from travel only: cell visits minus the ones made while fighting
+        local cells, fightCells = w.cells, w.fightCells
+        heatCache = {}
+        heatCells = setmetatable({}, {__index = function(_, k)
+            local c = cells[k]
+            return c and (c - (fightCells[k] or 0)) or nil
+        end})
+
+        -- Canvas position per cell (only cells we touch).
+        local px, py = {}, {}
+        local function Pos(key)
+            local x = px[key]
+            if not x then
+                local wx, wy = ns.CellPos(w, key)
+                x = (left - wx) / zw * width
+                px[key] = x
+                py[key] = (top - wy) / zh * height
+            end
+            return x, py[key]
+        end
+        local minX, maxX = -0.02 * width, 1.02 * width
+        local minY, maxY = -0.02 * height, 1.02 * height
+
+        -- 1. Collect visible undirected connections with their colour class.
+        local ea, eb, ecls, eused = {}, {}, {}, {}
+        local adj = {}   -- adj[cls][node] = {edge indices}
+        local n = 0
+        for ek, count in pairs(edges) do
+            local a, b = Split(ek)
+            local rk = b .. ">" .. a
+            local reverse = edges[rk]
+            if not reverse or a < b then
                 local travel = count - (fight[ek] or 0) + (reverse and (reverse - (fight[rk] or 0)) or 0)
                 local isFight = travel <= 0
-                local wanted = mode == "all" or (mode == "travel" and not isFight) or (mode == "grind" and isFight)
-                -- draw each connection once, even if it was walked both ways
-                if wanted and (not reverse or a < b) then
-                    local ax, ay = ns.CellPos(w, a)
-                    local bx, by = ns.CellPos(w, b)
-                    local x1, y1 = (left - ax) / zw, (top - ay) / zh
-                    local x2, y2 = (left - bx) / zw, (top - by) / zh
-                    if (x1 > -0.02 and x1 < 1.02 and y1 > -0.02 and y1 < 1.02)
-                        or (x2 > -0.02 and x2 < 1.02 and y2 > -0.02 and y2 < 1.02) then
-                        if used >= MAX_LINES then break end
-                        local line = Acquire()
-                        line:SetStartPoint("TOPLEFT", overlay, x1 * width, -y1 * height)
-                        line:SetEndPoint("TOPLEFT", overlay, x2 * width, -y2 * height)
-                        line:SetThickness(thick)
+                if mode == "all" or (mode == "travel" and not isFight) or (mode == "grind" and isFight) then
+                    local x1, y1 = Pos(a)
+                    local x2, y2 = Pos(b)
+                    if (x1 > minX and x1 < maxX and y1 > minY and y1 < maxY)
+                        or (x2 > minX and x2 < maxX and y2 > minY and y2 < maxY) then
+                        local cls
                         if drops[ek] and not reverse then
-                            line:SetColorTexture(0.4, 0.7, 1, 0.8)
+                            cls = "drop"
                         elseif isFight then
-                            line:SetColorTexture(0.75, 0.4, 1, 0.55)
+                            cls = "fight"
                         else
-                            line:SetColorTexture(HeatColor((Heat(a) + Heat(b)) / 2))
+                            cls = HeatBucket((Heat(a) + Heat(b)) / 2)
                         end
+                        n = n + 1
+                        ea[n], eb[n], ecls[n] = a, b, cls
+                        local byNode = adj[cls]
+                        if not byNode then byNode = {}; adj[cls] = byNode end
+                        local la = byNode[a]; if not la then la = {}; byNode[a] = la end
+                        local lb = byNode[b]; if not lb then lb = {}; byNode[b] = lb end
+                        la[#la + 1] = n
+                        lb[#lb + 1] = n
                     end
+                end
+            end
+        end
+
+        -- Follow a chain from `node` through any not-yet-drawn connection of the same colour
+        -- (also across junctions: a polyline may branch off later). Appends nodes to `chain`.
+        local function Extend(chain, node, from, cls)
+            local byNode = adj[cls]
+            while true do
+                local list = byNode[node]
+                local nxt
+                if list then
+                    for k = 1, #list do
+                        local e = list[k]
+                        if not eused[e] then nxt = e; break end
+                    end
+                end
+                if not nxt then return end
+                eused[nxt] = true
+                node = ea[nxt] == node and eb[nxt] or ea[nxt]
+                chain[#chain + 1] = node
+                from = nxt
+            end
+        end
+
+        -- 2. Join into chains, simplify, draw.
+        local thick = THICKNESS / scale
+        for i = 1, n do
+            if not eused[i] then
+                eused[i] = true
+                local cls = ecls[i]
+                local fwd = {ea[i], eb[i]}
+                Extend(fwd, eb[i], i, cls)
+                local back = {}
+                Extend(back, ea[i], i, cls)
+                -- chain = reverse(back) .. fwd
+                local xs, ys = {}, {}
+                for j = #back, 1, -1 do
+                    local x, y = Pos(back[j]); xs[#xs + 1] = x; ys[#ys + 1] = y
+                end
+                for j = 1, #fwd do
+                    local x, y = Pos(fwd[j]); xs[#xs + 1] = x; ys[#ys + 1] = y
+                end
+                local idx = Simplify(xs, ys, SIMPLIFY)
+                local r, g, b, a = ClassColor(cls)
+                for j = 1, #idx - 1 do
+                    if used >= MAX_LINES then break end
+                    local s, e = idx[j], idx[j + 1]
+                    local line = Acquire()
+                    line:SetStartPoint("TOPLEFT", overlay, xs[s], -ys[s])
+                    line:SetEndPoint("TOPLEFT", overlay, xs[e], -ys[e])
+                    line:SetThickness(thick)
+                    line:SetColorTexture(r, g, b, a)
                 end
             end
         end
@@ -126,6 +250,7 @@ local function Redraw()
     for i = used + 1, #lines do
         lines[i]:Hide()
     end
+    ns.lastLineCount = used
 end
 
 local function Restyle(scale)
@@ -142,11 +267,14 @@ local function OnUpdate(_, elapsed)
     local mapID = WorldMapFrame:GetMapID()
     local width, height = canvas:GetWidth(), canvas:GetHeight()
     local scale = WorldMapFrame.ScrollContainer:GetCanvasScale()
+    local settled = scale == lastScale
+    lastScale = scale
     if mapID ~= shownMap or width ~= shownW or height ~= shownH then
         Redraw()
-    elseif shownRev ~= ns.rev and sinceDraw >= REDRAW_INTERVAL then
+    elseif shownRev ~= ns.rev and sinceDraw >= REDRAW_INTERVAL and settled then
         Redraw()
-    elseif scale ~= shownScale then
+    elseif scale ~= shownScale and (settled or math.abs(scale / shownScale - 1) > ZOOM_DRIFT) then
+        -- Smooth zoom eases the scale over many frames: restyle once it settles, not every frame.
         Restyle(scale)
     end
 end

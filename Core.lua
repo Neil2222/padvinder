@@ -221,6 +221,7 @@ local function Info()
             :format(tostring(inst), cells, conns, travel, grinding))
     end
     if not any then ns.Print("nothing recorded yet. Go for a run!") end
+    if ns.lastLineCount then ns.Print("lines on the map last time it was drawn: " .. ns.lastLineCount) end
 end
 
 function ns.SetRecording(on)
