@@ -39,10 +39,30 @@ local function Acquire()
     return line
 end
 
-local function HeatColor(count)
-    -- 1 keer = geel, ~12+ keer = rood
-    local t = min(1, log(count) / log(12))
-    return 1, 0.95 - 0.7 * t, 0.2 - 0.1 * t, 0.55 + 0.4 * t
+-- Warmte van een cel = hoe vaak er in de buurt (3x3 cellen) gelopen is. Twee keer over dezelfde
+-- weg raakt zelden precies dezelfde cellen, maar wel dezelfde buurt.
+local heatCache, heatCells = {}, nil
+local function Heat(key)
+    local h = heatCache[key]
+    if not h then
+        local cx, cy = key:match("^(-?%d+):(-?%d+)$")
+        cx, cy = tonumber(cx), tonumber(cy)
+        local sum = 0
+        for i = -1, 1 do
+            for j = -1, 1 do
+                sum = sum + (heatCells[(cx + i) .. ":" .. (cy + j)] or 0)
+            end
+        end
+        h = sum / 3   -- één keer langslopen raakt ~3 cellen in de buurt
+        heatCache[key] = h
+    end
+    return h
+end
+
+local function HeatColor(heat)
+    -- 1 keer = geel, 2 = oranje, ~6+ keer = rood
+    local t = min(1, log(math.max(1, heat)) / log(6))
+    return 1, 1 - 0.9 * t, 0.2 - 0.2 * t, 0.6 + 0.35 * t
 end
 
 local function Redraw()
@@ -61,6 +81,7 @@ local function Redraw()
         if w then
             local edges, drops = w.edges, w.drops
             local thick = THICKNESS / scale
+            heatCache, heatCells = {}, w.cells
             for ek, count in pairs(edges) do
                 local a, b = Split(ek)
                 local reverse = edges[b .. ">" .. a]
@@ -80,7 +101,7 @@ local function Redraw()
                         if drops[ek] and not reverse then
                             line:SetColorTexture(0.4, 0.7, 1, 0.8)
                         else
-                            line:SetColorTexture(HeatColor(count + (reverse or 0)))
+                            line:SetColorTexture(HeatColor((Heat(a) + Heat(b)) / 2))
                         end
                     end
                 end
