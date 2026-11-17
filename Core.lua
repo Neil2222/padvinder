@@ -19,7 +19,7 @@ local CELL = 8            -- celgrootte in yards; ook de minimale stap tussen sa
 local MAX_STEP = 40       -- grotere sprong = teleport, hearth, res: geen verbinding
 local FALL_ONEWAY = 0.9   -- zoveel seconden vallen tussen twee samples = eenrichtingsverbinding
 local TICK = 0.1
-local COMBAT_LINGER = 8   -- zoveel seconden na een gevecht telt lopen nog als farmen (looten, volgende mob)
+local COMBAT_LINGER = 8   -- zoveel seconden na een gevecht telt lopen nog als grinden (looten, volgende mob)
 
 ns.CELL = CELL
 ns.rev = 0                -- verhoogt bij elke nieuwe data, zodat de kaart weet dat hij moet hertekenen
@@ -154,7 +154,7 @@ local function Info()
             local len = sqrt((ax - bx) ^ 2 + (ay - by) ^ 2)
             if n - (w.fight[ek] or 0) > 0 then travel = travel + len else fighting = fighting + len end
         end
-        ns.Print(("wereld %s: %d cellen, %d verbindingen, ~%.1f km reizen, ~%.1f km farmen")
+        ns.Print(("wereld %s: %d cellen, %d verbindingen, ~%.1f km reizen, ~%.1f km grinden")
             :format(tostring(inst), Count(w.cells), Count(w.edges),
                 travel * 0.9144 / 1000, fighting * 0.9144 / 1000))
     end
@@ -166,7 +166,7 @@ local function Help()
     print("  /pad info  - wat is er opgenomen")
     print("  /pad aan | uit  - opnemen aan/uit")
     print("  /pad kaart  - paden op de wereldkaart tonen/verbergen")
-    print("  /pad toon alles | reizen | gevecht  - welke paden op de kaart")
+    print("  /pad toon alles | reizen | grinden  - welke paden op de kaart")
     print("  /pad wis zeker  - ALLES wissen")
 end
 
@@ -186,13 +186,14 @@ SlashCmdList.PADVINDER = function(msg)
         ns.Print("paden op de kaart: " .. (PadvinderDB.showMap and "aan" or "uit") .. ".")
     elseif msg:match("^toon") then
         local mode = msg:match("^toon%s+(%S+)")
-        if mode == "alles" or mode == "reizen" or mode == "gevecht" then
+        if mode == "gevecht" or mode == "farmen" then mode = "grinden" end
+        if mode == "alles" or mode == "reizen" or mode == "grinden" then
             PadvinderDB.mapMode = mode
             PadvinderDB.showMap = true
             ns.rev = ns.rev + 1
             ns.Print("kaart toont nu: " .. mode .. ".")
         else
-            ns.Print("gebruik: /pad toon alles | reizen | gevecht")
+            ns.Print("gebruik: /pad toon alles | reizen | grinden")
         end
     elseif msg == "info" then
         Info()

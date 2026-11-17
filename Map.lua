@@ -1,6 +1,6 @@
 -- Tekent de opgenomen paden als heatmap op de wereldkaart.
 -- Geel = weinig gelopen, oranje/rood = vaak gelopen, blauw = alleen naar beneden gevallen,
--- paars = alleen tijdens/vlak na gevechten gelopen (farmen, niet reizen).
+-- paars = alleen tijdens/vlak na gevechten gelopen (grinden, niet reizen).
 
 local ADDON, ns = ...
 local HBD = LibStub("HereBeDragons-2.0")
@@ -96,7 +96,7 @@ local function Redraw()
                 local reverse = edges[rk]
                 local travel = count - (fight[ek] or 0) + (reverse and (reverse - (fight[rk] or 0)) or 0)
                 local isFight = travel <= 0
-                local wanted = mode == "alles" or (mode == "reizen" and not isFight) or (mode == "gevecht" and isFight)
+                local wanted = mode == "alles" or (mode == "reizen" and not isFight) or (mode == "grinden" and isFight)
                 -- elke verbinding één keer tekenen, ook als hij in beide richtingen gelopen is
                 if wanted and (not reverse or a < b) then
                     local ax, ay = ns.CellCenter(a)
