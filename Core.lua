@@ -139,34 +139,56 @@ local function Count(t)
     return n
 end
 
+-- Returns cells, connections, km travel, km grinding for one world.
+function ns.Stats(inst)
+    local w = PadvinderDB.worlds[inst]
+    if not w then return 0, 0, 0, 0 end
+    w = World(inst)
+    local travel, grinding = 0, 0
+    for ek, n in pairs(w.edges) do
+        local a, b = ek:match("^(.-)>(.+)$")
+        local ax, ay = ns.CellCenter(a)
+        local bx, by = ns.CellCenter(b)
+        local len = sqrt((ax - bx) ^ 2 + (ay - by) ^ 2)
+        if n - (w.fight[ek] or 0) > 0 then travel = travel + len else grinding = grinding + len end
+    end
+    return Count(w.cells), Count(w.edges), travel * 0.9144 / 1000, grinding * 0.9144 / 1000
+end
+
 local function Info()
     ns.Print("recording: " .. (PadvinderDB.recording and "|cff00ff00on|r" or "|cffff4444off|r")
         .. ", map: " .. (PadvinderDB.showMap and PadvinderDB.mapMode or "off"))
     local any = false
     for inst in pairs(PadvinderDB.worlds) do
-        local w = World(inst)
         any = true
-        local travel, grinding = 0, 0
-        for ek, n in pairs(w.edges) do
-            local a, b = ek:match("^(.-)>(.+)$")
-            local ax, ay = ns.CellCenter(a)
-            local bx, by = ns.CellCenter(b)
-            local len = sqrt((ax - bx) ^ 2 + (ay - by) ^ 2)
-            if n - (w.fight[ek] or 0) > 0 then travel = travel + len else grinding = grinding + len end
-        end
+        local cells, conns, travel, grinding = ns.Stats(inst)
         ns.Print(("world %s: %d cells, %d connections, ~%.1f km travel, ~%.1f km grinding")
-            :format(tostring(inst), Count(w.cells), Count(w.edges),
-                travel * 0.9144 / 1000, grinding * 0.9144 / 1000))
+            :format(tostring(inst), cells, conns, travel, grinding))
     end
     if not any then ns.Print("nothing recorded yet. Go for a run!") end
+end
+
+function ns.SetRecording(on)
+    PadvinderDB.recording = on
+    ns.Print("recording is " .. (on and "|cff00ff00on|r" or "|cffff4444off|r") .. ".")
+    if ns.UpdateButton then ns.UpdateButton() end
+end
+
+function ns.SetMap(show, mode)
+    PadvinderDB.showMap = show
+    if mode then PadvinderDB.mapMode = mode end
+    ns.rev = ns.rev + 1
+    ns.Print("map: " .. (show and PadvinderDB.mapMode or "off") .. ".")
+    if ns.UpdateButton then ns.UpdateButton() end
 end
 
 local function Help()
     ns.Print("commands:")
     print("  /pad info  - what has been recorded")
-    print("  /pad on | off  - recording on/off")
+    print("  /pad on | off | toggle  - recording on/off (toggle is handy for a macro)")
     print("  /pad map  - show/hide paths on the world map")
     print("  /pad show all | travel | grind  - which paths to show on the map")
+    print("  /pad button  - show/hide the minimap button")
     print("  /pad wipe confirm  - erase EVERYTHING")
 end
 
@@ -179,22 +201,19 @@ SLASH_PADVINDER2 = "/padvinder"
 SlashCmdList.PADVINDER = function(msg)
     msg = (msg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
     if msg == "on" then
-        PadvinderDB.recording = true
-        ns.Print("recording is |cff00ff00on|r.")
+        ns.SetRecording(true)
     elseif msg == "off" then
-        PadvinderDB.recording = false
-        ns.Print("recording is |cffff4444off|r.")
+        ns.SetRecording(false)
+    elseif msg == "toggle" then
+        ns.SetRecording(not PadvinderDB.recording)
     elseif msg == "map" then
-        PadvinderDB.showMap = not PadvinderDB.showMap
-        ns.rev = ns.rev + 1
-        ns.Print("paths on the map: " .. (PadvinderDB.showMap and "on" or "off") .. ".")
+        ns.SetMap(not PadvinderDB.showMap)
+    elseif msg == "button" then
+        if ns.ToggleButton then ns.ToggleButton() end
     elseif msg:match("^show") then
         local mode = MODE_ALIASES[msg:match("^show%s+(%S+)") or ""]
         if mode then
-            PadvinderDB.mapMode = mode
-            PadvinderDB.showMap = true
-            ns.rev = ns.rev + 1
-            ns.Print("map now shows: " .. mode .. ".")
+            ns.SetMap(true, mode)
         else
             ns.Print("usage: /pad show all | travel | grind")
         end
@@ -227,10 +246,12 @@ frame:SetScript("OnEvent", function(_, event, arg1)
         if db.recording == nil then db.recording = true end
         if db.showMap == nil then db.showMap = true end
         db.mapMode = OLD_MODES[db.mapMode] or db.mapMode or "all"
+        db.minimap = db.minimap or {}
         db.worlds = db.worlds or {}
         for inst in pairs(db.worlds) do World(inst) end   -- fill in newer tables for older data
     elseif event == "PLAYER_LOGIN" then
         if ns.InitMap then ns.InitMap() end
+        if ns.InitButton then ns.InitButton() end
         local acc = 0
         frame:SetScript("OnUpdate", function(_, elapsed)
             acc = acc + elapsed
