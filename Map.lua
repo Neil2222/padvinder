@@ -99,8 +99,8 @@ local function Redraw()
                 local wanted = mode == "all" or (mode == "travel" and not isFight) or (mode == "grind" and isFight)
                 -- draw each connection once, even if it was walked both ways
                 if wanted and (not reverse or a < b) then
-                    local ax, ay = ns.CellCenter(a)
-                    local bx, by = ns.CellCenter(b)
+                    local ax, ay = ns.CellPos(w, a)
+                    local bx, by = ns.CellPos(w, b)
                     local x1, y1 = (left - ax) / zw, (top - ay) / zh
                     local x2, y2 = (left - bx) / zw, (top - by) / zh
                     if (x1 > -0.02 and x1 < 1.02 and y1 > -0.02 and y1 < 1.02)

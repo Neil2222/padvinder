@@ -8,6 +8,7 @@
 --     swim  = { [cellKey] = true }        -- cell where you swam
 --     fight = { [edgeKey] = count }       -- part of edges[...] walked in/just after combat
 --     fightCells = { [cellKey] = count }  -- same for cells
+--     ax, ay = { [cellKey] = yards }      -- average position actually walked in the cell
 --   }
 -- Coordinates are world coordinates in yards (HereBeDragons), so paths continue
 -- across zone borders.
@@ -42,6 +43,8 @@ local function World(inst)
     w.swim = w.swim or {}
     w.fight = w.fight or {}
     w.fightCells = w.fightCells or {}
+    w.ax = w.ax or {}
+    w.ay = w.ay or {}
     return w
 end
 ns.World = World
@@ -60,6 +63,29 @@ function ns.CellCenter(key)
         centers[key] = c
     end
     return c[1], c[2]
+end
+
+-- Count a visit to a cell and fold the real position into its running average, so lines
+-- follow where you actually walked instead of a staircase of cell centres.
+local function Visit(w, key, x, y)
+    local n = (w.cells[key] or 0) + 1
+    w.cells[key] = n
+    local ax = w.ax[key]
+    if ax then
+        local ay = w.ay[key]
+        w.ax[key] = floor((ax + (x - ax) / n) * 10 + 0.5) / 10
+        w.ay[key] = floor((ay + (y - ay) / n) * 10 + 0.5) / 10
+    else
+        w.ax[key] = floor(x * 10 + 0.5) / 10
+        w.ay[key] = floor(y * 10 + 0.5) / 10
+    end
+end
+
+-- Where to draw a cell: its average walked position, or its centre for data from before 0.3.
+function ns.CellPos(w, key)
+    local ax = w.ax[key]
+    if ax then return ax, w.ay[key] end
+    return ns.CellCenter(key)
 end
 
 -- Recording state
@@ -99,7 +125,7 @@ local function Start(x, y, inst)
     lastX, lastY, lastInst = x, y, inst
     lastKey = CellKey(x, y)
     local w = World(inst)
-    w.cells[lastKey] = (w.cells[lastKey] or 0) + 1
+    Visit(w, lastKey, x, y)
     fallTime = 0
     ns.rev = ns.rev + 1
 end
@@ -138,7 +164,7 @@ local function Tick(elapsed)
     local key = CellKey(x, y)
     if key ~= lastKey then
         local w = World(inst)
-        w.cells[key] = (w.cells[key] or 0) + 1
+        Visit(w, key, x, y)
         local ek = lastKey .. ">" .. key
         w.edges[ek] = (w.edges[ek] or 0) + 1
         if fallTime >= FALL_ONEWAY then
