@@ -19,7 +19,8 @@ local CELL = 8            -- cell size in yards; also the minimum step between s
 local MAX_STEP = 40       -- a bigger jump = teleport, hearth, res: no connection
 local FALL_ONEWAY = 0.9   -- this many seconds falling between two samples = one-way connection
 local TICK = 0.1
-local COMBAT_LINGER = 8   -- for this many seconds after combat, walking still counts as grinding (looting, next mob)
+local COMBAT_LINGER = 30  -- for this many seconds after combat, walking still counts as grinding (looting, next mob)
+local COMBAT_LEADIN = 15  -- when combat starts, the last this-many seconds of walking count as grinding too (walking up to the mob)
 
 ns.CELL = CELL
 ns.rev = 0                -- bumped on every data change, so the map knows to redraw
@@ -66,6 +67,27 @@ local lastX, lastY, lastInst, lastKey
 local fallTime = 0
 local lastCombat = -1000
 local fightInStep = false
+local wasInCombat = false
+local recent = {}   -- recent travel steps {t, inst, ek, key}, retagged as grinding when combat starts
+
+local function TagFight(w, ek, key)
+    w.fight[ek] = (w.fight[ek] or 0) + 1
+    w.fightCells[key] = (w.fightCells[key] or 0) + 1
+end
+
+-- Combat just started: the walk leading up to it was grinding, not travel.
+local function RetagLeadIn(now)
+    for _, step in ipairs(recent) do
+        if now - step.t <= COMBAT_LEADIN then
+            local w = PadvinderDB.worlds[step.inst]
+            if w and (w.edges[step.ek] or 0) > (w.fight[step.ek] or 0) then
+                TagFight(w, step.ek, step.key)
+            end
+        end
+    end
+    wipe(recent)
+    ns.rev = ns.rev + 1
+end
 
 local function Break()
     lastX, lastY, lastInst, lastKey = nil, nil, nil, nil
@@ -92,7 +114,12 @@ local function Tick(elapsed)
 
     if IsFalling() then fallTime = fallTime + elapsed end
     local now = GetTime()
-    if UnitAffectingCombat("player") then lastCombat = now end
+    local inCombat = UnitAffectingCombat("player")
+    if inCombat then
+        lastCombat = now
+        if not wasInCombat then RetagLeadIn(now) end
+    end
+    wasInCombat = inCombat
     if now - lastCombat < COMBAT_LINGER then fightInStep = true end
 
     if not lastX or inst ~= lastInst then
@@ -121,8 +148,10 @@ local function Tick(elapsed)
         end
         if IsSwimming() then w.swim[key] = true end
         if fightInStep then
-            w.fight[ek] = (w.fight[ek] or 0) + 1
-            w.fightCells[key] = (w.fightCells[key] or 0) + 1
+            TagFight(w, ek, key)
+        else
+            recent[#recent + 1] = {t = now, inst = inst, ek = ek, key = key}
+            while recent[1] and now - recent[1].t > COMBAT_LEADIN do table.remove(recent, 1) end
         end
         lastKey = key
         ns.rev = ns.rev + 1
