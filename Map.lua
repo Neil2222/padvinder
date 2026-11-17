@@ -1,14 +1,14 @@
--- Tekent de opgenomen paden als heatmap op de wereldkaart.
--- Geel = weinig gelopen, oranje/rood = vaak gelopen, blauw = alleen naar beneden gevallen,
--- paars = alleen tijdens/vlak na gevechten gelopen (grinden, niet reizen).
+-- Draws the recorded paths as a heatmap on the world map.
+-- Yellow = walked rarely, orange/red = walked often, blue = only ever fallen down,
+-- purple = only walked during/just after combat (grinding, not travelling).
 
 local ADDON, ns = ...
 local HBD = LibStub("HereBeDragons-2.0")
 
-local THICKNESS = 2.5     -- lijndikte in schermpixels (gecorrigeerd voor inzoomen)
+local THICKNESS = 2.5     -- line width in screen pixels (corrected for zoom)
 local MAX_LINES = 15000
-local FRAME_LEVEL = 2010  -- net onder de iconen van Questie (2015+)
-local REDRAW_INTERVAL = 2 -- seconden: nieuwe data bij open kaart hooguit zo vaak hertekenen
+local FRAME_LEVEL = 2010  -- just below Questie's icons (2015+)
+local REDRAW_INTERVAL = 2 -- seconds: with the map open, redraw for new data at most this often
 
 local log, min = math.log, math.min
 
@@ -17,7 +17,7 @@ local lines, used = {}, 0
 local shownMap, shownW, shownH, shownScale, shownRev
 local sinceDraw = 0
 
--- Gesplitste edge-sleutels cachen
+-- Cache split edge keys
 local splitCache = {}
 local function Split(ek)
     local s = splitCache[ek]
@@ -40,8 +40,8 @@ local function Acquire()
     return line
 end
 
--- Warmte van een cel = hoe vaak er in de buurt (3x3 cellen) gelopen is. Twee keer over dezelfde
--- weg raakt zelden precies dezelfde cellen, maar wel dezelfde buurt.
+-- Heat of a cell = how often the area around it (3x3 cells) was walked. Walking the same road
+-- twice rarely hits exactly the same cells, but it does hit the same neighbourhood.
 local heatCache, heatCells = {}, nil
 local function Heat(key)
     local h = heatCache[key]
@@ -54,14 +54,14 @@ local function Heat(key)
                 sum = sum + (heatCells[(cx + i) .. ":" .. (cy + j)] or 0)
             end
         end
-        h = sum / 3   -- één keer langslopen raakt ~3 cellen in de buurt
+        h = sum / 3   -- one pass touches ~3 cells in the neighbourhood
         heatCache[key] = h
     end
     return h
 end
 
 local function HeatColor(heat)
-    -- 1 keer = geel, 2 = oranje, ~6+ keer = rood
+    -- 1 pass = yellow, 2 = orange, ~6+ = red
     local t = min(1, log(math.max(1, heat)) / log(6))
     return 1, 1 - 0.9 * t, 0.2 - 0.2 * t, 0.6 + 0.35 * t
 end
@@ -83,7 +83,7 @@ local function Redraw()
             local edges, drops, fight = w.edges, w.drops, w.fight
             local thick = THICKNESS / scale
             local mode = PadvinderDB.mapMode
-            -- warmte alleen uit reisbewegingen: cellen min de keren dat je er vocht
+            -- heat from travel only: cell visits minus the ones made while fighting
             local cells, fightCells = w.cells, w.fightCells
             heatCache = {}
             heatCells = setmetatable({}, {__index = function(_, k)
@@ -96,8 +96,8 @@ local function Redraw()
                 local reverse = edges[rk]
                 local travel = count - (fight[ek] or 0) + (reverse and (reverse - (fight[rk] or 0)) or 0)
                 local isFight = travel <= 0
-                local wanted = mode == "alles" or (mode == "reizen" and not isFight) or (mode == "grinden" and isFight)
-                -- elke verbinding één keer tekenen, ook als hij in beide richtingen gelopen is
+                local wanted = mode == "all" or (mode == "travel" and not isFight) or (mode == "grind" and isFight)
+                -- draw each connection once, even if it was walked both ways
                 if wanted and (not reverse or a < b) then
                     local ax, ay = ns.CellCenter(a)
                     local bx, by = ns.CellCenter(b)
@@ -157,7 +157,7 @@ function ns.InitMap()
     overlay = CreateFrame("Frame", nil, canvas)
     overlay:SetAllPoints(canvas)
     overlay:SetFrameLevel(FRAME_LEVEL)
-    -- OnUpdate draait alleen zolang de kaart open is
+    -- OnUpdate only runs while the map is open
     overlay:SetScript("OnUpdate", OnUpdate)
     overlay:SetScript("OnShow", function() shownMap = nil end)
 end
