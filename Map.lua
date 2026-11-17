@@ -1,5 +1,6 @@
 -- Tekent de opgenomen paden als heatmap op de wereldkaart.
--- Geel = weinig gelopen, oranje/rood = vaak gelopen, blauw = alleen naar beneden gevallen.
+-- Geel = weinig gelopen, oranje/rood = vaak gelopen, blauw = alleen naar beneden gevallen,
+-- paars = alleen tijdens/vlak na gevechten gelopen (farmen, niet reizen).
 
 local ADDON, ns = ...
 local HBD = LibStub("HereBeDragons-2.0")
@@ -79,14 +80,25 @@ local function Redraw()
         local zw, zh, left, top = data[1], data[2], data[3], data[4]
         local w = PadvinderDB.worlds[data.instance]
         if w then
-            local edges, drops = w.edges, w.drops
+            local edges, drops, fight = w.edges, w.drops, w.fight
             local thick = THICKNESS / scale
-            heatCache, heatCells = {}, w.cells
+            local mode = PadvinderDB.mapMode
+            -- warmte alleen uit reisbewegingen: cellen min de keren dat je er vocht
+            local cells, fightCells = w.cells, w.fightCells
+            heatCache = {}
+            heatCells = setmetatable({}, {__index = function(_, k)
+                local c = cells[k]
+                return c and (c - (fightCells[k] or 0)) or nil
+            end})
             for ek, count in pairs(edges) do
                 local a, b = Split(ek)
-                local reverse = edges[b .. ">" .. a]
+                local rk = b .. ">" .. a
+                local reverse = edges[rk]
+                local travel = count - (fight[ek] or 0) + (reverse and (reverse - (fight[rk] or 0)) or 0)
+                local isFight = travel <= 0
+                local wanted = mode == "alles" or (mode == "reizen" and not isFight) or (mode == "gevecht" and isFight)
                 -- elke verbinding één keer tekenen, ook als hij in beide richtingen gelopen is
-                if not reverse or a < b then
+                if wanted and (not reverse or a < b) then
                     local ax, ay = ns.CellCenter(a)
                     local bx, by = ns.CellCenter(b)
                     local x1, y1 = (left - ax) / zw, (top - ay) / zh
@@ -100,6 +112,8 @@ local function Redraw()
                         line:SetThickness(thick)
                         if drops[ek] and not reverse then
                             line:SetColorTexture(0.4, 0.7, 1, 0.8)
+                        elseif isFight then
+                            line:SetColorTexture(0.75, 0.4, 1, 0.55)
                         else
                             line:SetColorTexture(HeatColor((Heat(a) + Heat(b)) / 2))
                         end

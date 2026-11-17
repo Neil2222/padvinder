@@ -6,6 +6,8 @@
 --     edges = { ["cx:cy>cx:cy"] = aantal keer gelopen in die richting },
 --     drops = { [edgeKey] = true }   -- alleen gevallen, niet terug te lopen
 --     swim  = { [cellKey] = true }   -- cel waar gezwommen is
+--     fight = { [edgeKey] = aantal } -- deel van edges[...] dat in/vlak na gevecht gelopen is
+--     fightCells = { [cellKey] = aantal } -- idem voor cells
 --   }
 -- Coördinaten zijn wereldcoördinaten in yards (HereBeDragons), zodat paden
 -- doorlopen over zonegrenzen heen.
@@ -17,6 +19,7 @@ local CELL = 8            -- celgrootte in yards; ook de minimale stap tussen sa
 local MAX_STEP = 40       -- grotere sprong = teleport, hearth, res: geen verbinding
 local FALL_ONEWAY = 0.9   -- zoveel seconden vallen tussen twee samples = eenrichtingsverbinding
 local TICK = 0.1
+local COMBAT_LINGER = 8   -- zoveel seconden na een gevecht telt lopen nog als farmen (looten, volgende mob)
 
 ns.CELL = CELL
 ns.rev = 0                -- verhoogt bij elke nieuwe data, zodat de kaart weet dat hij moet hertekenen
@@ -29,9 +32,15 @@ function ns.Print(msg) print(PREFIX .. msg) end
 local function World(inst)
     local w = PadvinderDB.worlds[inst]
     if not w then
-        w = {cells = {}, edges = {}, drops = {}, swim = {}}
+        w = {}
         PadvinderDB.worlds[inst] = w
     end
+    w.cells = w.cells or {}
+    w.edges = w.edges or {}
+    w.drops = w.drops or {}
+    w.swim = w.swim or {}
+    w.fight = w.fight or {}
+    w.fightCells = w.fightCells or {}
     return w
 end
 ns.World = World
@@ -55,10 +64,13 @@ end
 -- Opname-toestand
 local lastX, lastY, lastInst, lastKey
 local fallTime = 0
+local lastCombat = -1000
+local fightInStep = false
 
 local function Break()
     lastX, lastY, lastInst, lastKey = nil, nil, nil, nil
     fallTime = 0
+    fightInStep = false
 end
 
 local function Start(x, y, inst)
@@ -79,6 +91,9 @@ local function Tick(elapsed)
     if issecretvalue and (issecretvalue(x) or issecretvalue(y)) then Break() return end
 
     if IsFalling() then fallTime = fallTime + elapsed end
+    local now = GetTime()
+    if UnitAffectingCombat("player") then lastCombat = now end
+    if now - lastCombat < COMBAT_LINGER then fightInStep = true end
 
     if not lastX or inst ~= lastInst then
         Start(x, y, inst)
@@ -105,11 +120,16 @@ local function Tick(elapsed)
             w.drops[ek] = nil   -- ooit normaal gelopen: dan is hij gewoon begaanbaar
         end
         if IsSwimming() then w.swim[key] = true end
+        if fightInStep then
+            w.fight[ek] = (w.fight[ek] or 0) + 1
+            w.fightCells[key] = (w.fightCells[key] or 0) + 1
+        end
         lastKey = key
         ns.rev = ns.rev + 1
     end
     lastX, lastY = x, y
     fallTime = 0
+    fightInStep = false
 end
 
 -- Statistieken
@@ -121,19 +141,22 @@ end
 
 local function Info()
     ns.Print("opnemen: " .. (PadvinderDB.recording and "|cff00ff00aan|r" or "|cffff4444uit|r")
-        .. ", kaart: " .. (PadvinderDB.showMap and "aan" or "uit"))
+        .. ", kaart: " .. (PadvinderDB.showMap and PadvinderDB.mapMode or "uit"))
     local any = false
-    for inst, w in pairs(PadvinderDB.worlds) do
+    for inst in pairs(PadvinderDB.worlds) do
+        local w = World(inst)
         any = true
-        local yards = 0
-        for ek in pairs(w.edges) do
+        local travel, fighting = 0, 0
+        for ek, n in pairs(w.edges) do
             local a, b = ek:match("^(.-)>(.+)$")
             local ax, ay = ns.CellCenter(a)
             local bx, by = ns.CellCenter(b)
-            yards = yards + sqrt((ax - bx) ^ 2 + (ay - by) ^ 2)
+            local len = sqrt((ax - bx) ^ 2 + (ay - by) ^ 2)
+            if n - (w.fight[ek] or 0) > 0 then travel = travel + len else fighting = fighting + len end
         end
-        ns.Print(("wereld %s: %d cellen, %d verbindingen, ~%.1f km gelopen pad")
-            :format(tostring(inst), Count(w.cells), Count(w.edges), yards * 0.9144 / 1000))
+        ns.Print(("wereld %s: %d cellen, %d verbindingen, ~%.1f km reizen, ~%.1f km farmen")
+            :format(tostring(inst), Count(w.cells), Count(w.edges),
+                travel * 0.9144 / 1000, fighting * 0.9144 / 1000))
     end
     if not any then ns.Print("nog niets opgenomen. Ga lekker rennen!") end
 end
@@ -143,6 +166,7 @@ local function Help()
     print("  /pad info  - wat is er opgenomen")
     print("  /pad aan | uit  - opnemen aan/uit")
     print("  /pad kaart  - paden op de wereldkaart tonen/verbergen")
+    print("  /pad toon alles | reizen | gevecht  - welke paden op de kaart")
     print("  /pad wis zeker  - ALLES wissen")
 end
 
@@ -160,6 +184,16 @@ SlashCmdList.PADVINDER = function(msg)
         PadvinderDB.showMap = not PadvinderDB.showMap
         ns.rev = ns.rev + 1
         ns.Print("paden op de kaart: " .. (PadvinderDB.showMap and "aan" or "uit") .. ".")
+    elseif msg:match("^toon") then
+        local mode = msg:match("^toon%s+(%S+)")
+        if mode == "alles" or mode == "reizen" or mode == "gevecht" then
+            PadvinderDB.mapMode = mode
+            PadvinderDB.showMap = true
+            ns.rev = ns.rev + 1
+            ns.Print("kaart toont nu: " .. mode .. ".")
+        else
+            ns.Print("gebruik: /pad toon alles | reizen | gevecht")
+        end
     elseif msg == "info" then
         Info()
     elseif msg == "wis zeker" then
@@ -186,7 +220,9 @@ frame:SetScript("OnEvent", function(_, event, arg1)
         db.version = db.version or 1
         if db.recording == nil then db.recording = true end
         if db.showMap == nil then db.showMap = true end
+        db.mapMode = db.mapMode or "alles"
         db.worlds = db.worlds or {}
+        for inst in pairs(db.worlds) do World(inst) end   -- oudere data aanvullen met nieuwe tabellen
     elseif event == "PLAYER_LOGIN" then
         if ns.InitMap then ns.InitMap() end
         local acc = 0
