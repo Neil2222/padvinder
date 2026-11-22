@@ -212,7 +212,8 @@ end
 
 local function Info()
     ns.Print("recording: " .. (PadvinderDB.recording and "|cff00ff00on|r" or "|cffff4444off|r")
-        .. ", map: " .. (PadvinderDB.showMap and PadvinderDB.mapMode or "off"))
+        .. ", map: " .. (PadvinderDB.showMap and PadvinderDB.mapMode or "off")
+        .. ", minimap: " .. (PadvinderDB.showMinimap and "on" or "off"))
     local any = false
     for inst in pairs(PadvinderDB.worlds) do
         any = true
@@ -222,12 +223,19 @@ local function Info()
     end
     if not any then ns.Print("nothing recorded yet. Go for a run!") end
     if ns.lastLineCount then ns.Print("lines on the map last time it was drawn: " .. ns.lastLineCount) end
+    if ns.lastMinimapLineCount then ns.Print("lines on the minimap right now: " .. ns.lastMinimapLineCount) end
 end
 
 function ns.SetRecording(on)
     PadvinderDB.recording = on
     ns.Print("recording is " .. (on and "|cff00ff00on|r" or "|cffff4444off|r") .. ".")
     if ns.UpdateButton then ns.UpdateButton() end
+end
+
+function ns.SetMinimap(show)
+    PadvinderDB.showMinimap = show
+    if ns.RefreshMinimap then ns.RefreshMinimap() end
+    ns.Print("minimap paths: " .. (show and "on" or "off") .. ".")
 end
 
 function ns.SetMap(show, mode)
@@ -243,7 +251,8 @@ local function Help()
     print("  /pad info  - what has been recorded")
     print("  /pad on | off | toggle  - recording on/off (toggle is handy for a macro)")
     print("  /pad map  - show/hide paths on the world map")
-    print("  /pad show all | travel | grind  - which paths to show on the map")
+    print("  /pad minimap  - show/hide paths on the minimap")
+    print("  /pad show all | travel | grind  - which paths to show (map and minimap)")
     print("  /pad button  - show/hide the minimap button")
     print("  /pad wipe confirm  - erase EVERYTHING")
 end
@@ -264,6 +273,8 @@ SlashCmdList.PADVINDER = function(msg)
         ns.SetRecording(not PadvinderDB.recording)
     elseif msg == "map" then
         ns.SetMap(not PadvinderDB.showMap)
+    elseif msg == "minimap" then
+        ns.SetMinimap(not PadvinderDB.showMinimap)
     elseif msg == "button" then
         if ns.ToggleButton then ns.ToggleButton() end
     elseif msg:match("^show") then
@@ -301,12 +312,14 @@ frame:SetScript("OnEvent", function(_, event, arg1)
         db.version = db.version or 1
         if db.recording == nil then db.recording = true end
         if db.showMap == nil then db.showMap = true end
+        if db.showMinimap == nil then db.showMinimap = true end
         db.mapMode = OLD_MODES[db.mapMode] or db.mapMode or "all"
         db.minimap = db.minimap or {}
         db.worlds = db.worlds or {}
         for inst in pairs(db.worlds) do World(inst) end   -- fill in newer tables for older data
     elseif event == "PLAYER_LOGIN" then
         if ns.InitMap then ns.InitMap() end
+        if ns.InitMinimap then ns.InitMinimap() end
         if ns.InitButton then ns.InitButton() end
         local acc = 0
         frame:SetScript("OnUpdate", function(_, elapsed)

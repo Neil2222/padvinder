@@ -1,5 +1,6 @@
 -- Minimap button (LibDBIcon), so it sits with the other addon buttons and can be dragged around.
 --   Left-click:  recording on/off
+--   Shift-click: minimap paths on/off
 --   Right-click: cycle map view (all -> travel -> grind -> off)
 
 local ADDON, ns = ...
@@ -20,7 +21,9 @@ function ns.UpdateButton()
 end
 
 local function OnClick(_, button)
-    if button == "RightButton" then
+    if IsShiftKeyDown() then
+        ns.SetMinimap(not PadvinderDB.showMinimap)
+    elseif button == "RightButton" then
         local current = PadvinderDB.showMap and PadvinderDB.mapMode or "off"
         local nextView = NEXT_VIEW[current] or "all"
         if nextView == "off" then
@@ -38,6 +41,7 @@ local function OnTooltipShow(tooltip)
     tooltip:AddDoubleLine("Recording",
         PadvinderDB.recording and "|cff00ff00on|r" or "|cffff4444off|r")
     tooltip:AddDoubleLine("Map", PadvinderDB.showMap and PadvinderDB.mapMode or "off", nil, nil, nil, 1, 1, 1)
+    tooltip:AddDoubleLine("Minimap", PadvinderDB.showMinimap and "on" or "off", nil, nil, nil, 1, 1, 1)
     local _, _, inst = HBD:GetPlayerWorldPosition()
     if inst and PadvinderDB.worlds[inst] then
         local _, _, travel, grinding = ns.Stats(inst)
@@ -47,6 +51,7 @@ local function OnTooltipShow(tooltip)
     tooltip:AddLine(" ")
     tooltip:AddLine("|cffffff00Left-click|r to toggle recording", 0.8, 0.8, 0.8)
     tooltip:AddLine("|cffffff00Right-click|r to change the map view", 0.8, 0.8, 0.8)
+    tooltip:AddLine("|cffffff00Shift-click|r to toggle paths on the minimap", 0.8, 0.8, 0.8)
 end
 
 function ns.ToggleButton()

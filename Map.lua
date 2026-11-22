@@ -1,4 +1,4 @@
--- Draws the recorded paths as a heatmap on the world map.
+-- Draws the recorded paths as a heatmap on the world map (colours: see Segments.lua).
 -- Yellow = walked rarely, orange/red = walked often, blue = only ever fallen down,
 -- purple = only walked during/just after combat (grinding, not travelling).
 --
@@ -15,27 +15,12 @@ local MAX_LINES = 6000
 local FRAME_LEVEL = 2010  -- just below Questie's icons (2015+)
 local REDRAW_INTERVAL = 5 -- seconds: with the map open, redraw for new data at most this often
 local SIMPLIFY = 1.0      -- max deviation in canvas units (~screen pixels) when simplifying chains
-local HEAT_STEPS = 5      -- heat colours are bucketed so chains can be joined
 local ZOOM_DRIFT = 0.25   -- restyle mid-zoom only when line width drifts this far
-
-local log, min, max, floor = math.log, math.min, math.max, math.floor
 
 local overlay
 local lines, used = {}, 0
 local shownMap, shownW, shownH, shownScale, shownRev, lastScale
 local sinceDraw = 0
-
--- Cache split edge keys
-local splitCache = {}
-local function Split(ek)
-    local s = splitCache[ek]
-    if not s then
-        local a, b = ek:match("^(.-)>(.+)$")
-        s = {a, b}
-        splitCache[ek] = s
-    end
-    return s[1], s[2]
-end
 
 local function Acquire()
     used = used + 1
@@ -46,40 +31,6 @@ local function Acquire()
     end
     line:Show()
     return line
-end
-
--- Heat of a cell = how often the area around it (3x3 cells) was walked. Walking the same road
--- twice rarely hits exactly the same cells, but it does hit the same neighbourhood.
-local heatCache, heatCells = {}, nil
-local function Heat(key)
-    local h = heatCache[key]
-    if not h then
-        local cx, cy = key:match("^(-?%d+):(-?%d+)$")
-        cx, cy = tonumber(cx), tonumber(cy)
-        local sum = 0
-        for i = -1, 1 do
-            for j = -1, 1 do
-                sum = sum + (heatCells[(cx + i) .. ":" .. (cy + j)] or 0)
-            end
-        end
-        h = sum / 3   -- one pass touches ~3 cells in the neighbourhood
-        heatCache[key] = h
-    end
-    return h
-end
-
--- Colour classes: 0..HEAT_STEPS = heat buckets, "drop", "fight".
-local function HeatBucket(heat)
-    -- 1 pass = yellow, 2 = orange, ~6+ = red
-    local t = min(1, log(max(1, heat)) / log(6))
-    return floor(t * HEAT_STEPS + 0.5)
-end
-
-local function ClassColor(cls)
-    if cls == "drop" then return 0.4, 0.7, 1, 0.8 end
-    if cls == "fight" then return 0.75, 0.4, 1, 0.55 end
-    local t = cls / HEAT_STEPS
-    return 1, 1 - 0.9 * t, 0.2 - 0.2 * t, 0.6 + 0.35 * t
 end
 
 -- Douglas-Peucker on parallel x/y arrays; returns the kept indices in order.
@@ -131,15 +82,8 @@ local function Redraw()
     local w = data and PadvinderDB.worlds[data.instance]
     if PadvinderDB.showMap and w and data[1] ~= 0 and data[2] ~= 0 and width > 0 then
         local zw, zh, left, top = data[1], data[2], data[3], data[4]
-        local edges, drops, fight = w.edges, w.drops, w.fight
         local mode = PadvinderDB.mapMode
-        -- heat from travel only: cell visits minus the ones made while fighting
-        local cells, fightCells = w.cells, w.fightCells
-        heatCache = {}
-        heatCells = setmetatable({}, {__index = function(_, k)
-            local c = cells[k]
-            return c and (c - (fightCells[k] or 0)) or nil
-        end})
+        local seg = ns.Segments(data.instance)
 
         -- Canvas position per cell (only cells we touch).
         local px, py = {}, {}
@@ -156,39 +100,26 @@ local function Redraw()
         local minX, maxX = -0.02 * width, 1.02 * width
         local minY, maxY = -0.02 * height, 1.02 * height
 
-        -- 1. Collect visible undirected connections with their colour class.
+        -- 1. Collect visible segments with their colour class.
         local ea, eb, ecls, eused = {}, {}, {}, {}
         local adj = {}   -- adj[cls][node] = {edge indices}
         local n = 0
-        for ek, count in pairs(edges) do
-            local a, b = Split(ek)
-            local rk = b .. ">" .. a
-            local reverse = edges[rk]
-            if not reverse or a < b then
-                local travel = count - (fight[ek] or 0) + (reverse and (reverse - (fight[rk] or 0)) or 0)
-                local isFight = travel <= 0
-                if mode == "all" or (mode == "travel" and not isFight) or (mode == "grind" and isFight) then
-                    local x1, y1 = Pos(a)
-                    local x2, y2 = Pos(b)
-                    if (x1 > minX and x1 < maxX and y1 > minY and y1 < maxY)
-                        or (x2 > minX and x2 < maxX and y2 > minY and y2 < maxY) then
-                        local cls
-                        if drops[ek] and not reverse then
-                            cls = "drop"
-                        elseif isFight then
-                            cls = "fight"
-                        else
-                            cls = HeatBucket((Heat(a) + Heat(b)) / 2)
-                        end
-                        n = n + 1
-                        ea[n], eb[n], ecls[n] = a, b, cls
-                        local byNode = adj[cls]
-                        if not byNode then byNode = {}; adj[cls] = byNode end
-                        local la = byNode[a]; if not la then la = {}; byNode[a] = la end
-                        local lb = byNode[b]; if not lb then lb = {}; byNode[b] = lb end
-                        la[#la + 1] = n
-                        lb[#lb + 1] = n
-                    end
+        for i = 1, seg and seg.n or 0 do
+            if ns.InMode(seg.fight[i], mode) then
+                local a, b = seg.a[i], seg.b[i]
+                local x1, y1 = Pos(a)
+                local x2, y2 = Pos(b)
+                if (x1 > minX and x1 < maxX and y1 > minY and y1 < maxY)
+                    or (x2 > minX and x2 < maxX and y2 > minY and y2 < maxY) then
+                    local cls = seg.cls[i]
+                    n = n + 1
+                    ea[n], eb[n], ecls[n] = a, b, cls
+                    local byNode = adj[cls]
+                    if not byNode then byNode = {}; adj[cls] = byNode end
+                    local la = byNode[a]; if not la then la = {}; byNode[a] = la end
+                    local lb = byNode[b]; if not lb then lb = {}; byNode[b] = lb end
+                    la[#la + 1] = n
+                    lb[#lb + 1] = n
                 end
             end
         end
@@ -233,7 +164,7 @@ local function Redraw()
                     local x, y = Pos(fwd[j]); xs[#xs + 1] = x; ys[#ys + 1] = y
                 end
                 local idx = Simplify(xs, ys, SIMPLIFY)
-                local r, g, b, a = ClassColor(cls)
+                local r, g, b, a = ns.ClassColor(cls)
                 for j = 1, #idx - 1 do
                     if used >= MAX_LINES then break end
                     local s, e = idx[j], idx[j + 1]
