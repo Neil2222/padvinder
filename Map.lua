@@ -17,6 +17,7 @@ local REDRAW_INTERVAL = 5 -- seconds: with the map open, redraw for new data at 
 local SIMPLIFY = 1.0      -- max deviation in canvas units (~screen pixels) when simplifying chains
 local ZOOM_DRIFT = 0.25   -- restyle mid-zoom only when line width drifts this far
 local ROUTE_THICKNESS = 4 -- the planned route (Route.lua), drawn on top of the paths
+local DASH, GAP = 7, 5    -- screen pixels: unsure stretches of the route are dashed
 
 local overlay
 local lines, used = {}, 0
@@ -48,24 +49,37 @@ local function DrawRoute()
     local width, height = canvas:GetWidth(), canvas:GetHeight()
     if route and route.legs and data and data[1] ~= 0 and data[2] ~= 0 then
         local zw, zh, left, top = data[1], data[2], data[3], data[4]
-        local thick = ROUTE_THICKNESS / WorldMapFrame.ScrollContainer:GetCanvasScale()
+        local scale = WorldMapFrame.ScrollContainer:GetCanvasScale()
+        local thick = ROUTE_THICKNESS / scale
+        local function Line(cls, x1, y1, x2, y2)
+            routeUsed = routeUsed + 1
+            local line = routeLines[routeUsed]
+            if not line then
+                line = overlay:CreateLine(nil, "OVERLAY", nil, 7)
+                routeLines[routeUsed] = line
+            end
+            line:SetStartPoint("TOPLEFT", overlay, x1, -y1)
+            line:SetEndPoint("TOPLEFT", overlay, x2, -y2)
+            line:SetThickness(thick)
+            line:SetColorTexture(ns.ClassColor(cls))
+            line:Show()
+        end
         for _, leg in ipairs(route.legs) do
             if leg.inst == data.instance then
-                -- walking cyan, flights and boats gold
-                local r, g, b, a = ns.ClassColor(leg.kind == "walk" and "route" or "routeAir")
-                local rx, ry = leg.x, leg.y
+                -- walking cyan (dashed where unsure), flights and boats gold
+                local rx, ry, sure = leg.x, leg.y, leg.sure
                 for i = 1, #rx - 1 do
-                    routeUsed = routeUsed + 1
-                    local line = routeLines[routeUsed]
-                    if not line then
-                        line = overlay:CreateLine(nil, "OVERLAY", nil, 7)
-                        routeLines[routeUsed] = line
+                    local x1, y1 = (left - rx[i]) / zw * width, (top - ry[i]) / zh * height
+                    local x2, y2 = (left - rx[i + 1]) / zw * width, (top - ry[i + 1]) / zh * height
+                    if leg.kind ~= "walk" then
+                        Line("routeAir", x1, y1, x2, y2)
+                    elseif sure and sure[i] then
+                        Line("route", x1, y1, x2, y2)
+                    else
+                        ns.Dashes(x1, y1, x2, y2, DASH / scale, GAP / scale, function(a, b, c, d)
+                            Line("routeGuess", a, b, c, d)
+                        end)
                     end
-                    line:SetStartPoint("TOPLEFT", overlay, (left - rx[i]) / zw * width, -(top - ry[i]) / zh * height)
-                    line:SetEndPoint("TOPLEFT", overlay, (left - rx[i + 1]) / zw * width, -(top - ry[i + 1]) / zh * height)
-                    line:SetThickness(thick)
-                    line:SetColorTexture(r, g, b, a)
-                    line:Show()
                 end
             end
         end
@@ -139,10 +153,7 @@ local function Restyle(scale)
     for i = 1, used do
         lines[i]:SetThickness(thick)
     end
-    local routeThick = ROUTE_THICKNESS / scale
-    for i = 1, routeUsed do
-        routeLines[i]:SetThickness(routeThick)
-    end
+    DrawRoute()   -- cheap; dash lengths depend on the zoom
 end
 
 local function OnUpdate(_, elapsed)

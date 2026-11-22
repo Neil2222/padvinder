@@ -22,6 +22,7 @@ local UPDATE_RATE = 30       -- max redraws per second
 local MOVE_PIXELS = 0.5      -- redraw when the player moved this many minimap pixels
 local EDGE = 0.95            -- clip at this fraction of the radius, just inside the border
 local HOLE = 9               -- no lines within this many minimap units of the player arrow
+local DASH, GAP = 5, 4       -- minimap units: unsure stretches of the route are dashed
 
 -- Diameter of the minimap in yards per zoom level, for clients without C_Minimap.GetViewRadius.
 local MINIMAP_SIZE = {
@@ -210,7 +211,7 @@ end
 
 local function DrawLine(cls, x1, y1, x2, y2)
     local line
-    if cls == "route" or cls == "routeAir" then
+    if cls == "route" or cls == "routeAir" or cls == "routeGuess" then
         line = AcquireRoute(cls)
     else
         if used >= MAX_LINES then return end
@@ -289,13 +290,22 @@ local function Draw(x, y, inst, radius, halfWidth, facing, square)
     if route and route.legs then
         for li, leg in ipairs(route.legs) do
             if leg.inst == inst then
-                local cls = leg.kind == "walk" and "route" or "routeAir"
-                local rx, ry = leg.x, leg.y
+                local rx, ry, sure = leg.x, leg.y, leg.sure
                 for i = (li == 1 and ns.RouteStart and ns.RouteStart() or 1), #rx - 1 do
                     local ax, ay = Screen(rx[i], ry[i])
                     local bx, by = Screen(rx[i + 1], ry[i + 1])
                     local sx1, sy1, sx2, sy2 = Clip(ax, ay, bx, by, clipR)
-                    if sx1 then DrawWithHole(cls, sx1, sy1, sx2, sy2, HOLE) end
+                    if sx1 then
+                        if leg.kind ~= "walk" then
+                            DrawWithHole("routeAir", sx1, sy1, sx2, sy2, HOLE)
+                        elseif sure and sure[i] then
+                            DrawWithHole("route", sx1, sy1, sx2, sy2, HOLE)
+                        else
+                            ns.Dashes(sx1, sy1, sx2, sy2, DASH, GAP, function(a, b, c, d)
+                                DrawWithHole("routeGuess", a, b, c, d, HOLE)
+                            end)
+                        end
+                    end
                 end
             end
         end

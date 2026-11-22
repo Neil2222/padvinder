@@ -51,10 +51,25 @@ end
 function ns.ClassColor(cls)
     if cls == "route" then return 0.2, 0.95, 1, 1 end         -- planned route, walking (Route.lua)
     if cls == "routeAir" then return 1, 0.82, 0.25, 0.9 end   -- planned route, flight/boat/zeppelin
+    if cls == "routeGuess" then return 0.2, 0.95, 1, 0.75 end -- planned route over unknown ground (dashed)
     if cls == "drop" then return 0.4, 0.7, 1, 0.8 end
     if cls == "fight" then return 0.75, 0.4, 1, 0.55 end
     local t = cls / HEAT_STEPS
     return 1, 1 - 0.9 * t, 0.2 - 0.2 * t, 0.6 + 0.35 * t
+end
+
+-- Calls line(x1, y1, x2, y2) for the dashes of a line: dash long, gap between them.
+function ns.Dashes(x1, y1, x2, y2, dash, gap, line)
+    local dx, dy = x2 - x1, y2 - y1
+    local len = math.sqrt(dx * dx + dy * dy)
+    if len == 0 then return end
+    local ux, uy = dx / len, dy / len
+    local s = 0
+    while s < len do
+        local e = math.min(len, s + dash)
+        line(x1 + ux * s, y1 + uy * s, x1 + ux * e, y1 + uy * e)
+        s = e + gap
+    end
 end
 
 -- Does a segment belong in the given map mode ("all", "travel", "grind")?

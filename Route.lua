@@ -11,8 +11,12 @@
 --    air. Boarding costs some time, air nodes are joined by the flights between them.
 --  * every boat/zeppelin/portal dock is a node, joined to where the ride lands.
 --  * flight masters and docks are joined to recorded cells near them (walking off-road).
--- Leaving the paths is allowed but costs OFFROAD times the distance, so routes stick to the paths
--- unless cutting across saves a lot. Costs are in "yards walked": time x running speed.
+--  * where you have never been: "probable ground" from QuestieDB's spawns and patrol paths
+--    (Walkable.lua), trusted less than your own paths.
+-- Leaving all of that is allowed but costs more the longer the blind stretch is (Blind): a
+-- few yards are fine, a long straight line through unknown land likely runs into a mountain. Costs are in "yards walked": time x running speed.
+-- Every stretch of a route is marked sure (your own paths) or not (probable or unknown ground);
+-- the map draws the unsure ones dashed and the arrow says "unknown ground".
 --
 -- All heavy work (building the graph, the search) runs in a coroutine, a few milliseconds per
 -- frame, so it never makes the game hitch.
@@ -20,7 +24,19 @@
 local ADDON, ns = ...
 local HBD = LibStub("HereBeDragons-2.0")
 
-local OFFROAD = 2.0         -- cost factor for walking where nothing was recorded
+local OFFROAD = 2.0         -- cost factor for a short walk where nothing is known ...
+local BLIND_SCALE = 100     -- ... plus 1 for every this many yards of the blind stretch
+-- Probable ground (QuestieDB spawns): how much a step between two spawn squares costs grows with
+-- the gap between them. Dense spawns (a valley full of mobs) are cheap; a lone mob on a ridge
+-- 70 yards from the next is hardly better than walking blind.
+local WILD_BASE = 1.2       -- cost factor for a step between squares right next to each other ...
+local WILD_PER_YARD = 1/80  -- ... plus this much per yard of gap
+local PATROL_FACTOR = 1.2   -- along a patrol path (QuestieDB)
+local WALK_LINK = 160       -- yards: probable-ground squares this close can be joined ...
+local WALK_NEAREST = 6      -- ... each to its this many nearest (keeps the graph small)
+local WILD_FACTOR = WILD_BASE + 16 * WILD_PER_YARD   -- joining probable ground to recorded paths
+local JOIN = 16             -- yards: probable ground and recorded paths this close are joined
+local SURE_SHORT = 20       -- yards: a stretch this short counts as sure anyway
 local GRIND_FACTOR = 1.3    -- connections only walked while grinding (mob areas)
 local SWIM_FACTOR = 1.5
 local HOP_FACTOR = 1.4      -- jumping between neighbouring tracks
@@ -68,6 +84,10 @@ local function Dist(x1, y1, x2, y2)
     local dx, dy = x2 - x1, y2 - y1
     return sqrt(dx * dx + dy * dy)
 end
+-- Cost of walking d yards in a straight line through unknown land.
+local function Blind(d)
+    return d * (OFFROAD + d / BLIND_SCALE)
+end
 
 ---------------------------------------------------------------------------------------------
 -- Graph
@@ -75,8 +95,8 @@ end
 local graph
 
 local function BuildGraph()
-    local g = {rev = ns.rev, trev = ns.transportRev, worlds = PadvinderDB.worlds, built = GetTime(),
-        X = {}, Y = {}, I = {}, air = {}, grid = {}, to = {}, cost = {}, tag = {}, trans = {}}
+    local g = {rev = ns.rev, trev = ns.transportRev, wrev = ns.walkRev, worlds = PadvinderDB.worlds, built = GetTime(),
+        X = {}, Y = {}, I = {}, air = {}, rec = {}, grid = {}, wgrid = {}, to = {}, cost = {}, tag = {}, trans = {}}
     local X, Y, I, grid, to, cost, tag = g.X, g.Y, g.I, g.grid, g.to, g.cost, g.tag
     local n = 0
     local function NewNode(x, y, inst)
@@ -106,6 +126,7 @@ local function BuildGraph()
             local cx, cy = key:match("^(-?%d+):(-?%d+)$")
             local x, y = ns.CellPos(w, key)
             local v = NewNode(x, y, inst)
+            g.rec[v] = true
             ids[key] = v
             grid[GridKey(inst, tonumber(cx), tonumber(cy))] = v
             k = k + 1
@@ -157,6 +178,76 @@ local function BuildGraph()
             k = k + 1
             if k % 100 == 0 then MaybeYield() end
         end
+    end
+
+    -- probable ground (QuestieDB): squares, their neighbours, patrol paths, and joins with paths
+    local WC = ns.WALK_CELL or 32
+    for inst, wl in pairs(ns.walk or {}) do
+        local node, wmap = {}, {}
+        g.wgrid[inst] = wmap
+        for i = 1, wl.n do
+            local v = NewNode(wl.X[i], wl.Y[i], inst)
+            node[i] = v
+            wmap[ns.WalkKey(wl.CX[i], wl.CY[i])] = v
+            if i % 300 == 0 then MaybeYield() end
+        end
+        local WX, WY, WCX, WCY, wgridl = wl.X, wl.Y, wl.CX, wl.CY, wl.grid
+        local reach = floor(WALK_LINK / WC) + 1
+        local candJ, candD = {}, {}
+        for i = 1, wl.n do
+            local cx, cy = WCX[i], WCY[i]
+            -- the nearest squares around this one, joined both ways
+            local nc = 0
+            for dx = -reach, reach do
+                for dy = -reach, reach do
+                    local j = wgridl[ns.WalkKey(cx + dx, cy + dy)]
+                    if j and j ~= i then
+                        local d = Dist(WX[i], WY[i], WX[j], WY[j])
+                        if d <= WALK_LINK then
+                            nc = nc + 1
+                            candJ[nc], candD[nc] = j, d
+                        end
+                    end
+                end
+            end
+            for _ = 1, min(WALK_NEAREST, nc) do
+                local best = 1
+                for c = 2, nc do
+                    if candD[c] < candD[best] then best = c end
+                end
+                local j, d = candJ[best], candD[best]
+                candD[best] = huge
+                local f = WILD_BASE + d * WILD_PER_YARD
+                if d * f < Blind(d) then
+                    Link(node[i], node[j], d * f)
+                    Link(node[j], node[i], d * f)
+                end
+            end
+            -- join with recorded cells close by
+            local rcx, rcy = floor(WX[i] / ns.CELL), floor(WY[i] / ns.CELL)
+            local rr = floor(JOIN / ns.CELL) + 1
+            for dx = -rr, rr do
+                for dy = -rr, rr do
+                    local v = grid[GridKey(inst, rcx + dx, rcy + dy)]
+                    if v then
+                        local d = Dist(WX[i], WY[i], X[v], Y[v])
+                        if d <= JOIN then
+                            Link(node[i], v, d * WILD_FACTOR)
+                            Link(v, node[i], d * WILD_FACTOR)
+                        end
+                    end
+                end
+            end
+            if i % 100 == 0 then MaybeYield() end
+        end
+        local pt = wl.patrol
+        for k = 1, #pt - 1, 2 do
+            local a, b = pt[k], pt[k + 1]
+            local d = Dist(WX[a], WY[a], WX[b], WY[b])
+            Link(node[a], node[b], d * PATROL_FACTOR)
+            Link(node[b], node[a], d * PATROL_FACTOR)
+        end
+        MaybeYield()
     end
 
     -- flight points: ground node (the flight master) and air node
@@ -227,8 +318,8 @@ local function BuildGraph()
                 if v then
                     local d = Dist(tx, ty, X[v], Y[v])
                     if d <= LINK_RADIUS then
-                        Link(t, v, d * OFFROAD)
-                        Link(v, t, d * OFFROAD)
+                        Link(t, v, Blind(d))
+                        Link(v, t, Blind(d))
                     end
                 end
             end
@@ -236,7 +327,7 @@ local function BuildGraph()
         for _, o in ipairs(trans) do
             if o ~= t and I[o] == inst then
                 local d = Dist(tx, ty, X[o], Y[o])
-                if d <= LINK_RADIUS then Link(t, o, d * OFFROAD) end
+                if d <= LINK_RADIUS then Link(t, o, Blind(d)) end
             end
         end
         MaybeYield()
@@ -298,7 +389,7 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
 
     -- straight there (same continent only)
     local best, bestFrom = huge, nil
-    if sinst == tinst then best, bestFrom = OFFROAD * Dist(sx, sy, tx, ty), 0 end
+    if sinst == tinst then best, bestFrom = Blind(Dist(sx, sy, tx, ty)), 0 end
 
     -- walk off-road to recorded cells, flight masters and docks near the start
     local r = floor(START_RADIUS / ns.CELL) + 1
@@ -308,14 +399,29 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
             local v = grid[GridKey(sinst, scx + dx, scy + dy)]
             if v then
                 local d = Dist(sx, sy, X[v], Y[v])
-                if d <= START_RADIUS then Reach(v, d * OFFROAD, 0) end
+                if d <= START_RADIUS then Reach(v, Blind(d), 0) end
             end
         end
     end
     for _, t in ipairs(g.trans) do
         if I[t] == sinst then
             local d = Dist(sx, sy, X[t], Y[t])
-            if d <= LINK_RADIUS then Reach(t, d * OFFROAD, 0) end
+            if d <= LINK_RADIUS then Reach(t, Blind(d), 0) end
+        end
+    end
+    local wmap = g.wgrid[sinst]
+    if wmap then
+        local WC = ns.WALK_CELL or 32
+        local wr = floor(START_RADIUS / WC) + 1
+        local wcx, wcy = floor(sx / WC), floor(sy / WC)
+        for dx = -wr, wr do
+            for dy = -wr, wr do
+                local v = wmap[ns.WalkKey(wcx + dx, wcy + dy)]
+                if v then
+                    local d = Dist(sx, sy, X[v], Y[v])
+                    if d <= START_RADIUS then Reach(v, Blind(d), 0) end
+                end
+            end
         end
     end
 
@@ -328,7 +434,7 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
             local gu = gScore[u]
             -- leave here and walk straight to the goal
             if I[u] == tinst and not air[u] then
-                local c = gu + OFFROAD * Dist(X[u], Y[u], tx, ty)
+                local c = gu + Blind(Dist(X[u], Y[u], tx, ty))
                 if c < best then best, bestFrom = c, u end
             end
             local tu, cu, tg = to[u], cost[u], tag[u]
@@ -350,13 +456,21 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
     end
 
     local legs = {}
-    local leg = {kind = "walk", inst = sinst, x = {sx}, y = {sy}}
+    local leg = {kind = "walk", inst = sinst, x = {sx}, y = {sy}, sure = {}}
     legs[1] = leg
+    local prev = 0   -- previous node (0: the start)
+    -- add a walking point; the stretch to it is sure when it runs between two recorded cells
+    local function WalkTo(v, x, y)
+        local n = #leg.x
+        local short = Dist(leg.x[n], leg.y[n], x, y) <= SURE_SHORT
+        leg.sure[n] = short or (v ~= 0 and prev ~= 0 and g.rec[prev] and g.rec[v]) or false
+        leg.x[n + 1], leg.y[n + 1] = x, y
+    end
     for i = #nodes, 1, -1 do
         local v = nodes[i]
         local t = via[v]
         if not t then
-            leg.x[#leg.x + 1], leg.y[#leg.y + 1] = X[v], Y[v]
+            WalkTo(v, X[v], Y[v])
         elseif t.kind == "board" then
             leg.action = {kind = "flight", from = t.node.short}
             leg = {kind = "air", inst = I[v], x = {X[v]}, y = {Y[v]}}
@@ -368,7 +482,7 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
                 local a = legs[j].action
                 if a and a.kind == "flight" and not a.to then a.to = t.node.short break end
             end
-            leg = {kind = "walk", inst = I[v], x = {X[v]}, y = {Y[v]}}
+            leg = {kind = "walk", inst = I[v], x = {X[v]}, y = {Y[v]}, sure = {}}
             legs[#legs + 1] = leg
         elseif t.kind == "ride" then
             local ride = t.ride
@@ -376,16 +490,17 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
             if ride.finst == ride.tinst then
                 legs[#legs + 1] = {kind = "air", inst = I[v], x = {ride.fx, ride.tx}, y = {ride.fy, ride.ty}}
             end
-            leg = {kind = "walk", inst = I[v], x = {X[v]}, y = {Y[v]}}
+            leg = {kind = "walk", inst = I[v], x = {X[v]}, y = {Y[v]}, sure = {}}
             legs[#legs + 1] = leg
         end
+        prev = v
     end
-    leg.x[#leg.x + 1], leg.y[#leg.y + 1] = tx, ty
+    WalkTo(0, tx, ty)
     return legs, #nodes
 end
 
--- Douglas-Peucker for a route leg (same idea as Segments.lua, on a plain list).
-local function SimplifyLeg(xs, ys, tol)
+-- Douglas-Peucker for a stretch of a route leg (same idea as Segments.lua, on a plain list).
+local function SimplifyRun(xs, ys, tol)
     local n = #xs
     if n <= 2 then return xs, ys end
     local keep = {[1] = true, [n] = true}
@@ -420,6 +535,27 @@ local function SimplifyLeg(xs, ys, tol)
         if keep[i] then ox[#ox + 1], oy[#oy + 1] = xs[i], ys[i] end
     end
     return ox, oy
+end
+
+-- Simplify a walking leg run by run, so sure and unsure stretches keep their own points.
+local function SimplifyLeg(leg, tol)
+    local xs, ys, sure = leg.x, leg.y, leg.sure
+    local ox, oy, os = {xs[1]}, {ys[1]}, {}
+    local i, n = 1, #xs
+    while i < n do
+        local j = i
+        while j < n - 1 and sure[j + 1] == sure[i] do j = j + 1 end
+        -- points i .. j+1 form one run
+        local rx, ry = {}, {}
+        for k = i, j + 1 do rx[#rx + 1], ry[#ry + 1] = xs[k], ys[k] end
+        rx, ry = SimplifyRun(rx, ry, tol)
+        for k = 2, #rx do
+            os[#ox] = sure[i]
+            ox[#ox + 1], oy[#oy + 1] = rx[k], ry[k]
+        end
+        i = j + 1
+    end
+    leg.x, leg.y, leg.sure = ox, oy, os
 end
 
 ---------------------------------------------------------------------------------------------
@@ -460,23 +596,25 @@ local function Plan()
     local g0 = goal
     job = coroutine.create(function()
         if not graph or graph.worlds ~= PadvinderDB.worlds or graph.trev ~= ns.transportRev
+            or graph.wrev ~= ns.walkRev
             or (graph.rev ~= ns.rev and GetTime() - graph.built > GRAPH_MAX_AGE) then
             graph = BuildGraph()
         end
         local legs, nodeCount = FindPath(graph, x, y, inst, g0.x, g0.y, g0.inst)
         if goal ~= g0 then return end   -- target changed meanwhile
-        if not legs or (nodeCount == 0 and #legs == 1) then
-            SetRoute(nil)   -- no way, or straight there is best: TomTom's own arrow does that
+        if not legs then
+            SetRoute(nil)   -- no way at all (another continent without a known way there)
             return
         end
         for _, leg in ipairs(legs) do
-            if leg.kind == "walk" then leg.x, leg.y = SimplifyLeg(leg.x, leg.y, SIMPLIFY) end
+            if leg.kind == "walk" then SimplifyLeg(leg, SIMPLIFY) end
         end
         local first = legs[1]
         local cum = {0}
         for i = 2, #first.x do cum[i] = cum[i - 1] + Dist(first.x[i - 1], first.y[i - 1], first.x[i], first.y[i]) end
-        SetRoute({x = first.x, y = first.y, cum = cum, n = #first.x, inst = first.inst,
-            action = first.action, legs = legs})
+        -- (a straight line still gets drawn; its arrow is TomTom's own, see Update)
+        SetRoute({x = first.x, y = first.y, cum = cum, n = #first.x, inst = first.inst, sure = first.sure,
+            action = first.action, legs = legs, straight = nodeCount == 0})
     end)
 end
 
@@ -571,7 +709,9 @@ local function ArrowOnUpdate(_, elapsed)
     if action then
         TomTom:SetCrazyArrowTitle(ActionText(action), Distance(remaining or 0) .. " " .. WHERE[action.kind], "")
     else
-        TomTom:SetCrazyArrowTitle(goal and goal.title or "Waypoint", Distance(remaining or 0) .. " |cff66ccffvia paths|r", "")
+        local sure = route and route.sure and route.sure[segIdx]
+        TomTom:SetCrazyArrowTitle(goal and goal.title or "Waypoint", Distance(remaining or 0)
+            .. (sure and " |cff66ccffvia paths|r" or " |cffffaa00unknown ground|r"), "")
     end
 end
 
@@ -623,9 +763,14 @@ local function Update()
         return
     end
 
+    -- probable ground (QuestieDB) became available after this route was planned
+    if graph and graph.wrev ~= ns.walkRev and not job and now - lastPlan > 1 then
+        Plan()
+    end
+
     if not route then
         Release()
-        -- no route (no way known, or straight was best): try again after a change
+        -- no route (no way known): try again after a change
         if not job and now - lastPlan > REROUTE_MIN
             and (inst ~= planInst or Dist(x, y, planX or x, planY or y) > 100) then
             Plan()
@@ -695,9 +840,10 @@ function ns.RouteInfo()
         if action then
             return ("%s, %d yards %s"):format(ActionText(action), floor(remaining + 0.5), WHERE[action.kind])
         end
+        if ns.route.straight then return ("%d yards, straight (unknown ground)"):format(floor(remaining + 0.5)) end
         return ("%d yards via paths"):format(floor(remaining + 0.5))
     elseif goal then
-        return "straight line (no better way known)"
+        return "no way known"
     end
     return "no waypoint"
 end
