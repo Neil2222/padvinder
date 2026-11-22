@@ -16,11 +16,14 @@ local FRAME_LEVEL = 2010  -- just below Questie's icons (2015+)
 local REDRAW_INTERVAL = 5 -- seconds: with the map open, redraw for new data at most this often
 local SIMPLIFY = 1.0      -- max deviation in canvas units (~screen pixels) when simplifying chains
 local ZOOM_DRIFT = 0.25   -- restyle mid-zoom only when line width drifts this far
+local ROUTE_THICKNESS = 4 -- the planned route (Route.lua), drawn on top of the paths
 
 local overlay
 local lines, used = {}, 0
 local shownMap, shownW, shownH, shownScale, shownRev, lastScale
 local sinceDraw = 0
+local routeLines, routeUsed = {}, 0
+local shownRouteRev
 
 local function Acquire()
     used = used + 1
@@ -31,6 +34,38 @@ local function Acquire()
     end
     line:Show()
     return line
+end
+
+-- The planned route, on top of the paths. Cheap (a few dozen lines), so it is redrawn
+-- right away whenever the route changes.
+local function DrawRoute()
+    routeUsed = 0
+    shownRouteRev = ns.routeRev
+    local route = ns.route
+    local mapID = WorldMapFrame:GetMapID()
+    local data = mapID and HBD.mapData[mapID]
+    local canvas = WorldMapFrame:GetCanvas()
+    local width, height = canvas:GetWidth(), canvas:GetHeight()
+    if route and data and data.instance == route.inst and data[1] ~= 0 and data[2] ~= 0 then
+        local zw, zh, left, top = data[1], data[2], data[3], data[4]
+        local thick = ROUTE_THICKNESS / WorldMapFrame.ScrollContainer:GetCanvasScale()
+        local r, g, b, a = ns.ClassColor("route")
+        local rx, ry = route.x, route.y
+        for i = 1, route.n - 1 do
+            routeUsed = routeUsed + 1
+            local line = routeLines[routeUsed]
+            if not line then
+                line = overlay:CreateLine(nil, "OVERLAY", nil, 7)
+                routeLines[routeUsed] = line
+            end
+            line:SetStartPoint("TOPLEFT", overlay, (left - rx[i]) / zw * width, -(top - ry[i]) / zh * height)
+            line:SetEndPoint("TOPLEFT", overlay, (left - rx[i + 1]) / zw * width, -(top - ry[i + 1]) / zh * height)
+            line:SetThickness(thick)
+            line:SetColorTexture(r, g, b, a)
+            line:Show()
+        end
+    end
+    for i = routeUsed + 1, #routeLines do routeLines[i]:Hide() end
 end
 
 local function Redraw()
@@ -90,6 +125,7 @@ local function Redraw()
         lines[i]:Hide()
     end
     ns.lastLineCount = used
+    DrawRoute()
 end
 
 local function Restyle(scale)
@@ -97,6 +133,10 @@ local function Restyle(scale)
     local thick = THICKNESS / scale
     for i = 1, used do
         lines[i]:SetThickness(thick)
+    end
+    local routeThick = ROUTE_THICKNESS / scale
+    for i = 1, routeUsed do
+        routeLines[i]:SetThickness(routeThick)
     end
 end
 
@@ -116,6 +156,7 @@ local function OnUpdate(_, elapsed)
         -- Smooth zoom eases the scale over many frames: restyle once it settles, not every frame.
         Restyle(scale)
     end
+    if shownRouteRev ~= ns.routeRev then DrawRoute() end
 end
 
 function ns.InitMap()

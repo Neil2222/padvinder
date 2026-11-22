@@ -30,6 +30,7 @@ local function HeatBucket(heat)
 end
 
 function ns.ClassColor(cls)
+    if cls == "route" then return 0.2, 0.95, 1, 1 end   -- planned route (Route.lua)
     if cls == "drop" then return 0.4, 0.7, 1, 0.8 end
     if cls == "fight" then return 0.75, 0.4, 1, 0.55 end
     local t = cls / HEAT_STEPS

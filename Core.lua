@@ -224,6 +224,7 @@ local function Info()
     end
     if not any then ns.Print("nothing recorded yet. Go for a run!") end
     if ns.lastLineCount then ns.Print("lines on the map last time it was drawn: " .. ns.lastLineCount) end
+    if ns.RouteInfo then ns.Print("route: " .. ns.RouteInfo()) end
     if ns.lastMinimapLineCount then ns.Print("lines on the minimap right now: " .. ns.lastMinimapLineCount) end
 end
 
@@ -254,6 +255,7 @@ local function Help()
     print("  /pad map  - show/hide paths on the world map")
     print("  /pad minimap  - show/hide paths on the minimap")
     print("  /pad show all | travel | grind  - which paths to show (map and minimap)")
+    print("  /pad route  - route planner on/off (follows your TomTom/Questie waypoint)")
     print("  /pad button  - show/hide the minimap button")
     print("  /pad wipe confirm  - erase EVERYTHING")
 end
@@ -276,6 +278,8 @@ SlashCmdList.PADVINDER = function(msg)
         ns.SetMap(not PadvinderDB.showMap)
     elseif msg == "minimap" then
         ns.SetMinimap(not PadvinderDB.showMinimap)
+    elseif msg == "route" then
+        if ns.SetRouting then ns.SetRouting(not PadvinderDB.routing) end
     elseif msg == "button" then
         if ns.ToggleButton then ns.ToggleButton() end
     elseif msg:match("^show") then
@@ -314,6 +318,7 @@ frame:SetScript("OnEvent", function(_, event, arg1)
         if db.recording == nil then db.recording = true end
         if db.showMap == nil then db.showMap = true end
         if db.showMinimap == nil then db.showMinimap = true end
+        if db.routing == nil then db.routing = true end
         db.mapMode = OLD_MODES[db.mapMode] or db.mapMode or "all"
         db.minimap = db.minimap or {}
         db.worlds = db.worlds or {}

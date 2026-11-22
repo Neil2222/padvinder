@@ -13,6 +13,7 @@ local ADDON, ns = ...
 local HBD = LibStub("HereBeDragons-2.0")
 
 local THICKNESS = 2          -- line width in minimap units (~pixels)
+local ROUTE_THICKNESS = 3    -- the planned route (Route.lua)
 local MAX_LINES = 3000
 local BUCKET = 64            -- spatial index square size in yards
 local SIMPLIFY = 0.75        -- max deviation in yards when simplifying chains
@@ -31,6 +32,8 @@ local floor, sqrt, sin, cos, abs, min, max = math.floor, math.sqrt, math.sin, ma
 
 local overlay
 local lines, used = {}, 0
+local routeLines, routeUsed = {}, 0
+local drawnRouteRev
 
 -- Drawn pieces (world yards) and the spatial index: buckets[key] = {piece indices}
 local px1, py1, px2, py2, pcls, stamp = {}, {}, {}, {}, {}, {}
@@ -109,9 +112,23 @@ local function Acquire(cls)
     return line
 end
 
+local function AcquireRoute()
+    routeUsed = routeUsed + 1
+    local line = routeLines[routeUsed]
+    if not line then
+        line = overlay:CreateLine(nil, "OVERLAY")
+        line:SetThickness(ROUTE_THICKNESS)
+        line:SetColorTexture(ns.ClassColor("route"))
+        routeLines[routeUsed] = line
+    end
+    line:Show()
+    return line
+end
+
 local function HideAll()
     for i = 1, used do lines[i]:Hide() end
-    used = 0
+    for i = 1, routeUsed do routeLines[i]:Hide() end
+    used, routeUsed = 0, 0
     lastX = nil
 end
 
@@ -160,8 +177,13 @@ local function ClipSquare(x1, y1, x2, y2, r)
 end
 
 local function DrawLine(cls, x1, y1, x2, y2)
-    if used >= MAX_LINES then return end
-    local line = Acquire(cls)
+    local line
+    if cls == "route" then
+        line = AcquireRoute()
+    else
+        if used >= MAX_LINES then return end
+        line = Acquire(cls)
+    end
     line:SetStartPoint("CENTER", overlay, x1, y1)
     line:SetEndPoint("CENTER", overlay, x2, y2)
 end
@@ -188,14 +210,19 @@ local function DrawWithHole(cls, x1, y1, x2, y2, r)
     if h1 < 1 then DrawLine(cls, x1 + h1 * dx, y1 + h1 * dy, x2, y2) end
 end
 
-local function Draw(x, y, radius, halfWidth, facing, square)
-    used = 0
+local function Draw(x, y, inst, radius, halfWidth, facing, square)
+    used, routeUsed = 0, 0
     drawId = drawId + 1
     local scale = halfWidth / radius             -- minimap units per yard
     local clipR = halfWidth * EDGE
     local Clip = square and ClipSquare or ClipCircle
     local rotate = facing ~= 0
     local fs, fc = sin(facing), cos(facing)
+    local function Screen(wx, wy)   -- same maths as HereBeDragons-Pins
+        local ax, ay = x - wx, y - wy
+        if rotate then ax, ay = ax * fc - ay * fs, ax * fs + ay * fc end
+        return ax * scale, -ay * scale
+    end
 
     -- buckets that can hold visible pieces (corners of a square map reach radius * sqrt 2)
     local reach = radius * (square and 1.42 or 1)
@@ -224,6 +251,20 @@ local function Draw(x, y, radius, halfWidth, facing, square)
     end
     for i = used + 1, #lines do lines[i]:Hide() end
     ns.lastMinimapLineCount = used
+
+    -- the planned route, from the player's current stretch onwards
+    local route = ns.route
+    if route and route.inst == inst then
+        local rx, ry = route.x, route.y
+        for i = (ns.RouteStart and ns.RouteStart() or 1), route.n - 1 do
+            local ax, ay = Screen(rx[i], ry[i])
+            local bx, by = Screen(rx[i + 1], ry[i + 1])
+            local sx1, sy1, sx2, sy2 = Clip(ax, ay, bx, by, clipR)
+            if sx1 then DrawWithHole("route", sx1, sy1, sx2, sy2, HOLE) end
+        end
+    end
+    for i = routeUsed + 1, #routeLines do routeLines[i]:Hide() end
+    drawnRouteRev = ns.routeRev
 end
 
 local function ViewRadius()
@@ -241,12 +282,12 @@ local function OnUpdate(_, elapsed)
     sinceUpdate = 0
 
     if not PadvinderDB.showMinimap or IsInInstance() then
-        if used > 0 then HideAll() end
+        if used + routeUsed > 0 then HideAll() end
         return
     end
     local x, y, inst = HBD:GetPlayerWorldPosition()
     if not x or not y or not inst or (issecretvalue and (issecretvalue(x) or issecretvalue(y))) then
-        if used > 0 then HideAll() end
+        if used + routeUsed > 0 then HideAll() end
         return
     end
 
@@ -258,7 +299,7 @@ local function OnUpdate(_, elapsed)
     if GetCVar("rotateMinimap") == "1" then
         facing = GetPlayerFacing()
         if not facing then
-            if used > 0 then HideAll() end
+            if used + routeUsed > 0 then HideAll() end
             return
         end
     end
@@ -267,6 +308,7 @@ local function OnUpdate(_, elapsed)
     local square = GetMinimapShape and GetMinimapShape() == "SQUARE" or false
 
     -- skip when nothing visible changed
+    if ns.routeRev ~= drawnRouteRev then dirty = true end
     if not dirty and lastX and radius == lastRadius and halfWidth == lastWidth
         and square == lastSquare and abs(facing - lastFacing) < 0.005 then
         local dx, dy = x - lastX, y - lastY
@@ -275,7 +317,7 @@ local function OnUpdate(_, elapsed)
     lastX, lastY, lastFacing, lastRadius, lastWidth, lastSquare = x, y, facing, radius, halfWidth, square
     dirty = false
 
-    Draw(x, y, radius, halfWidth, facing, square)
+    Draw(x, y, inst, radius, halfWidth, facing, square)
 end
 
 -- Rebuild and redraw on the next update (e.g. after turning minimap paths on).

@@ -42,6 +42,9 @@ local function OnTooltipShow(tooltip)
         PadvinderDB.recording and "|cff00ff00on|r" or "|cffff4444off|r")
     tooltip:AddDoubleLine("Map", PadvinderDB.showMap and PadvinderDB.mapMode or "off", nil, nil, nil, 1, 1, 1)
     tooltip:AddDoubleLine("Minimap", PadvinderDB.showMinimap and "on" or "off", nil, nil, nil, 1, 1, 1)
+    if ns.RouteInfo then
+        tooltip:AddDoubleLine("Route", ns.RouteInfo(), nil, nil, nil, 1, 1, 1)
+    end
     local _, _, inst = HBD:GetPlayerWorldPosition()
     if inst and PadvinderDB.worlds[inst] then
         local _, _, travel, grinding = ns.Stats(inst)
