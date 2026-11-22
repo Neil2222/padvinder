@@ -50,8 +50,11 @@ local FLIGHT_CURVE = 1.4    -- unknown flight: this many times the straight line
 local BOARD = 15            -- seconds: talking to the flight master, taking off
 local LAND = 3              -- seconds: landing, getting off
 local RIDE = { boat = 170, zeppelin = 170, portal = 10 }   -- seconds: waiting plus crossing
-local SIMPLIFY = 2          -- yards, route simplification
-local LOOKAHEAD = 20        -- yards: the arrow points this far ahead along the route
+local SIMPLIFY = 3          -- yards: route simplification on your own paths ...
+local SIMPLIFY_GUESS = 10   -- ... and on guessed stretches (probable ground zigzags between squares)
+local LOOKAHEAD = 30        -- yards: the arrow points at the first route point this far from you
+local LOOKAHEAD_MAX = 80    -- yards along the route: look no further than this for that point
+local BACKTRACK = 3         -- yards: progress along the route may only go back this much
 local OFF_ROUTE = 35        -- yards away from the route ...
 local OFF_ROUTE_TIME = 2    -- ... for this many seconds: plan again
 local REROUTE_MIN = 3       -- seconds between plans
@@ -548,7 +551,7 @@ local function SimplifyLeg(leg, tol)
         -- points i .. j+1 form one run
         local rx, ry = {}, {}
         for k = i, j + 1 do rx[#rx + 1], ry[#ry + 1] = xs[k], ys[k] end
-        rx, ry = SimplifyRun(rx, ry, tol)
+        rx, ry = SimplifyRun(rx, ry, sure[i] and tol or SIMPLIFY_GUESS)
         for k = 2, #rx do
             os[#ox] = sure[i]
             ox[#ox + 1], oy[#oy + 1] = rx[k], ry[k]
@@ -567,6 +570,8 @@ local lastPlan = -1000
 local planX, planY, planInst
 local offSince
 local segIdx = 1
+local progress = 0        -- yards along the current route, never goes back more than BACKTRACK
+local handedOver = false  -- the arrow went back to TomTom for the last stretch
 local targetX, targetY, remaining
 local hijacked = false
 local landed = false
@@ -579,6 +584,7 @@ local function SetRoute(route)
     ns.route = route
     ns.routeRev = ns.routeRev + 1
     segIdx = 1
+    progress, handedOver = 0, false
     targetX, targetY, remaining = nil, nil, nil
 end
 
@@ -779,6 +785,9 @@ local function Update()
     end
 
     local along, off = Progress(route, x, y)
+    -- Walking beside a zigzag, the nearest bit of route can lie behind you: don't go back.
+    if along < progress - BACKTRACK then along = progress - BACKTRACK end
+    if along > progress then progress = along end
     if off > OFF_ROUTE then
         offSince = offSince or now
         if now - offSince > OFF_ROUTE_TIME and now - lastPlan > REROUTE_MIN and not job then Plan() end
@@ -787,11 +796,19 @@ local function Update()
     end
 
     remaining = route.cum[route.n] - along + off
-    targetX, targetY = PointAt(route, along + LOOKAHEAD)
+    -- The arrow's target: the first point along the route at least LOOKAHEAD yards from you (so
+    -- walking a few yards beside the line it still points forward, not at the line).
+    local ahead = along + LOOKAHEAD
+    for a = along + 5, along + LOOKAHEAD_MAX, 5 do
+        local tx, ty = PointAt(route, a)
+        if Dist(x, y, tx, ty) >= LOOKAHEAD then ahead = a break end
+    end
+    targetX, targetY = PointAt(route, ahead)
 
     -- On the last straight stretch to the goal the route is the straight line: TomTom's own arrow
     -- (with its arrival animation) does that best. Not when a flight or boat comes next.
-    if segIdx >= route.n - 1 and not route.action then
+    if handedOver or (segIdx >= route.n - 1 and not route.action) then
+        handedOver = true   -- (stays handed over: no flipping back and forth at the last bend)
         Release()
     elseif not hijacked and CanHijack() then
         hijacked = true
