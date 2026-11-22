@@ -8,7 +8,26 @@
 local ADDON, ns = ...
 
 local HEAT_STEPS = 5
+local BUDGET_MS = 3   -- work per frame for builds that run in a coroutine
 local log, min, max, floor = math.log, math.min, math.max, math.floor
+
+-- Time slicing for heavy builds. Code running in a coroutine calls ns.MaybeYield() now and then;
+-- it gives the frame back once BUDGET_MS is used up. Outside a coroutine it does nothing, so the
+-- same functions also work in one go (the world map).
+local function Clock()
+    return debugprofilestop and debugprofilestop() or os.clock() * 1000
+end
+local sliceStart = 0
+function ns.SliceStart() sliceStart = Clock() end
+function ns.MaybeYield()
+    if Clock() - sliceStart > BUDGET_MS then
+        local co, isMain = coroutine.running()
+        if co and not isMain then
+            coroutine.yield()
+            sliceStart = Clock()
+        end
+    end
+end
 
 -- Cache split edge keys
 local splitCache = {}
@@ -30,7 +49,8 @@ local function HeatBucket(heat)
 end
 
 function ns.ClassColor(cls)
-    if cls == "route" then return 0.2, 0.95, 1, 1 end   -- planned route (Route.lua)
+    if cls == "route" then return 0.2, 0.95, 1, 1 end         -- planned route, walking (Route.lua)
+    if cls == "routeAir" then return 1, 0.82, 0.25, 0.9 end   -- planned route, flight/boat/zeppelin
     if cls == "drop" then return 0.4, 0.7, 1, 0.8 end
     if cls == "fight" then return 0.75, 0.4, 1, 0.55 end
     local t = cls / HEAT_STEPS
@@ -101,6 +121,7 @@ function ns.Segments(inst)
             n = n + 1
             seg.a[n], seg.b[n] = a, b
             seg.cls[n], seg.fight[n] = Classify(w, ek, a, b, heatCache)
+            if n % 200 == 0 then ns.MaybeYield() end
         end
     end
     seg.n = n
@@ -163,6 +184,7 @@ function ns.Polylines(seg, include, Pos, tol, emit)
             local lb = byNode[b]; if not lb then lb = {}; byNode[b] = lb end
             la[#la + 1] = n
             lb[#lb + 1] = n
+            if n % 500 == 0 then ns.MaybeYield() end
         end
     end
 
@@ -202,6 +224,7 @@ function ns.Polylines(seg, include, Pos, tol, emit)
                 local x, y = Pos(fwd[j]); xs[#xs + 1] = x; ys[#ys + 1] = y
             end
             if emit(xs, ys, Simplify(xs, ys, tol), cls) == false then return end
+            if i % 50 == 0 then ns.MaybeYield() end
         end
     end
 end

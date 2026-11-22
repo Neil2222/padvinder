@@ -4,7 +4,8 @@
 --
 -- Performance (the minimap is drawn while you play, so this must never hitch):
 --  * The full picture is built only on login, a new continent, a new map mode or a wipe:
---    connections are joined into chains and simplified, so a straight road is one line.
+--    connections are joined into chains and simplified, so a straight road is one line. That
+--    build runs in a coroutine, a few milliseconds per frame.
 --  * Newly walked connections are added one by one (ns.OnNewEdge), no rebuild.
 --  * Pieces sit in a spatial index (BUCKET-yard squares); an update only looks at those near
 --    the player, and only when the picture changed (moved half a pixel, turned, zoomed).
@@ -35,12 +36,13 @@ local lines, used = {}, 0
 local routeLines, routeUsed = {}, 0
 local drawnRouteRev
 
--- Drawn pieces (world yards) and the spatial index: buckets[key] = {piece indices}
-local px1, py1, px2, py2, pcls, stamp = {}, {}, {}, {}, {}, {}
-local pn = 0
-local buckets = {}
+-- Drawn pieces (world yards) and the spatial index: buckets[key] = {piece indices}.
+-- A set holds them for one continent; the one being drawn is "live", its arrays are upvalues.
+local px1, py1, px2, py2, pcls, stamp, buckets
+local live
 local drawId = 0
 local indexInst, indexW, indexMode
+local buildJob, pending   -- running rebuild, connections walked meanwhile
 local dirty = true
 local sinceUpdate = 0
 local lastX, lastY, lastFacing, lastRadius, lastWidth, lastSquare
@@ -49,51 +51,78 @@ local function BucketKey(bx, by)
     return (bx + 50000) * 100000 + (by + 50000)
 end
 
-local function AddPiece(x1, y1, x2, y2, cls)
-    pn = pn + 1
-    px1[pn], py1[pn], px2[pn], py2[pn], pcls[pn] = x1, y1, x2, y2, cls
+local function NewSet(inst)
+    return {inst = inst, n = 0, x1 = {}, y1 = {}, x2 = {}, y2 = {}, cls = {}, stamp = {}, buckets = {}}
+end
+
+local function Use(set)
+    live = set
+    px1, py1, px2, py2, pcls, stamp, buckets = set.x1, set.y1, set.x2, set.y2, set.cls, set.stamp, set.buckets
+    dirty = true
+end
+Use(NewSet())
+
+local function AddPiece(set, x1, y1, x2, y2, cls)
+    local n = set.n + 1
+    set.n = n
+    set.x1[n], set.y1[n], set.x2[n], set.y2[n], set.cls[n] = x1, y1, x2, y2, cls
+    local sb = set.buckets
     for bx = floor(min(x1, x2) / BUCKET), floor(max(x1, x2) / BUCKET) do
         for by = floor(min(y1, y2) / BUCKET), floor(max(y1, y2) / BUCKET) do
             local k = BucketKey(bx, by)
-            local list = buckets[k]
-            if not list then list = {}; buckets[k] = list end
-            list[#list + 1] = pn
+            local list = sb[k]
+            if not list then list = {}; sb[k] = list end
+            list[#list + 1] = n
         end
     end
 end
 
-local function Rebuild(inst)
-    indexInst, indexMode = inst, PadvinderDB.mapMode
-    indexW = PadvinderDB.worlds[inst]
-    px1, py1, px2, py2, pcls, stamp = {}, {}, {}, {}, {}, {}
-    pn, buckets = 0, {}
-    dirty = true
-    local w = indexW
-    local seg = w and ns.Segments(inst)
-    if not seg then return end
-    local mode = indexMode
-    ns.Polylines(seg,
-        function(i) return ns.InMode(seg.fight[i], mode) end,
-        function(key) return ns.CellPos(w, key) end,
-        SIMPLIFY,
-        function(xs, ys, idx, cls)
-            for j = 1, #idx - 1 do
-                local s, e = idx[j], idx[j + 1]
-                AddPiece(xs[s], ys[s], xs[e], ys[e], cls)
-            end
-        end)
-end
-
--- Called by the recorder after it stored a step a -> b (edge key ek) in world w.
-function ns.OnNewEdge(inst, w, ek, a, b)
-    if inst ~= indexInst or w ~= indexW then return end   -- a rebuild is coming anyway
+-- A newly walked connection a -> b (edge key ek): draw it right away.
+local function AddEdge(set, w, ek, a, b)
     if w.edges[ek] ~= 1 or w.edges[b .. ">" .. a] then return end   -- already drawn
     local cls, isFight = ns.ClassifyEdge(w, ek)
     if not ns.InMode(isFight, indexMode) then return end
     local x1, y1 = ns.CellPos(w, a)
     local x2, y2 = ns.CellPos(w, b)
-    AddPiece(x1, y1, x2, y2, cls)
-    dirty = true
+    AddPiece(set, x1, y1, x2, y2, cls)
+end
+
+local function Rebuild(inst)
+    indexInst, indexMode = inst, PadvinderDB.mapMode
+    indexW = PadvinderDB.worlds[inst]
+    -- another continent: don't draw the old one's pieces around the player meanwhile
+    if live.inst ~= inst then Use(NewSet(inst)) end
+    local w, mode = indexW, indexMode
+    pending = {}
+    buildJob = coroutine.create(function()
+        local set = NewSet(inst)
+        local seg = w and ns.Segments(inst)
+        if seg then
+            ns.Polylines(seg,
+                function(i) return ns.InMode(seg.fight[i], mode) end,
+                function(key) return ns.CellPos(w, key) end,
+                SIMPLIFY,
+                function(xs, ys, idx, cls)
+                    for j = 1, #idx - 1 do
+                        local s, e = idx[j], idx[j + 1]
+                        AddPiece(set, xs[s], ys[s], xs[e], ys[e], cls)
+                    end
+                end)
+        end
+        for _, p in ipairs(pending) do AddEdge(set, p[1], p[2], p[3], p[4]) end
+        pending = nil
+        Use(set)
+    end)
+end
+
+-- Called by the recorder after it stored a step a -> b (edge key ek) in world w.
+function ns.OnNewEdge(inst, w, ek, a, b)
+    if inst ~= indexInst or w ~= indexW then return end   -- a rebuild is coming anyway
+    if pending then pending[#pending + 1] = {w, ek, a, b} end
+    if live.inst == inst then
+        AddEdge(live, w, ek, a, b)
+        dirty = true
+    end
 end
 
 local function Acquire(cls)
@@ -112,14 +141,17 @@ local function Acquire(cls)
     return line
 end
 
-local function AcquireRoute()
+local function AcquireRoute(cls)
     routeUsed = routeUsed + 1
     local line = routeLines[routeUsed]
     if not line then
         line = overlay:CreateLine(nil, "OVERLAY")
         line:SetThickness(ROUTE_THICKNESS)
-        line:SetColorTexture(ns.ClassColor("route"))
         routeLines[routeUsed] = line
+    end
+    if line.padCls ~= cls then
+        line.padCls = cls
+        line:SetColorTexture(ns.ClassColor(cls))
     end
     line:Show()
     return line
@@ -178,8 +210,8 @@ end
 
 local function DrawLine(cls, x1, y1, x2, y2)
     local line
-    if cls == "route" then
-        line = AcquireRoute()
+    if cls == "route" or cls == "routeAir" then
+        line = AcquireRoute(cls)
     else
         if used >= MAX_LINES then return end
         line = Acquire(cls)
@@ -252,15 +284,20 @@ local function Draw(x, y, inst, radius, halfWidth, facing, square)
     for i = used + 1, #lines do lines[i]:Hide() end
     ns.lastMinimapLineCount = used
 
-    -- the planned route, from the player's current stretch onwards
+    -- the planned route (walking cyan, flights and boats gold), from the player's spot onwards
     local route = ns.route
-    if route and route.inst == inst then
-        local rx, ry = route.x, route.y
-        for i = (ns.RouteStart and ns.RouteStart() or 1), route.n - 1 do
-            local ax, ay = Screen(rx[i], ry[i])
-            local bx, by = Screen(rx[i + 1], ry[i + 1])
-            local sx1, sy1, sx2, sy2 = Clip(ax, ay, bx, by, clipR)
-            if sx1 then DrawWithHole("route", sx1, sy1, sx2, sy2, HOLE) end
+    if route and route.legs then
+        for li, leg in ipairs(route.legs) do
+            if leg.inst == inst then
+                local cls = leg.kind == "walk" and "route" or "routeAir"
+                local rx, ry = leg.x, leg.y
+                for i = (li == 1 and ns.RouteStart and ns.RouteStart() or 1), #rx - 1 do
+                    local ax, ay = Screen(rx[i], ry[i])
+                    local bx, by = Screen(rx[i + 1], ry[i + 1])
+                    local sx1, sy1, sx2, sy2 = Clip(ax, ay, bx, by, clipR)
+                    if sx1 then DrawWithHole(cls, sx1, sy1, sx2, sy2, HOLE) end
+                end
+            end
         end
     end
     for i = routeUsed + 1, #routeLines do routeLines[i]:Hide() end
@@ -293,6 +330,16 @@ local function OnUpdate(_, elapsed)
 
     if inst ~= indexInst or PadvinderDB.mapMode ~= indexMode or PadvinderDB.worlds[inst] ~= indexW then
         Rebuild(inst)
+    end
+    if buildJob then
+        ns.SliceStart()
+        local ok, err = coroutine.resume(buildJob)
+        if not ok then
+            buildJob, pending = nil, nil
+            ns.Print("minimap paths failed: " .. tostring(err))
+        elseif coroutine.status(buildJob) == "dead" then
+            buildJob = nil
+        end
     end
 
     local facing = 0

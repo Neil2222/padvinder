@@ -1,15 +1,21 @@
 -- Route planner: when TomTom's arrow has a target (set by you, Questie, ...), find a route there
--- over the recorded paths and let TomTom's arrow point along that route instead of in a straight
--- line. The route is drawn on the minimap and world map (Minimap.lua, Map.lua).
+-- over the recorded paths, flight paths, boats and zeppelins, and let TomTom's arrow point along
+-- that route instead of in a straight line. The route is drawn on the minimap and world map
+-- (Minimap.lua, Map.lua).
 --
--- Graph: every recorded cell is a node. Walked connections can be used both ways, except
--- drops (only ever fallen down). Grinding-only connections and swimming cost a bit more.
--- Nearby cells that aren't connected (parallel tracks of the same road) get a "hop" link.
--- Leaving the paths is allowed but costs OFFROAD times the distance, so the route sticks to
--- the paths unless cutting across saves a lot.
+-- Graph, over all continents:
+--  * every recorded cell is a node. Walked connections can be used both ways, except drops (only
+--    ever fallen down). Grinding-only connections and swimming cost a bit more. Nearby cells that
+--    aren't connected (parallel tracks of the same road) get a "hop" link.
+--  * every flight point you have found is two nodes: on the ground (the flight master) and in the
+--    air. Boarding costs some time, air nodes are joined by the flights between them.
+--  * every boat/zeppelin/portal dock is a node, joined to where the ride lands.
+--  * flight masters and docks are joined to recorded cells near them (walking off-road).
+-- Leaving the paths is allowed but costs OFFROAD times the distance, so routes stick to the paths
+-- unless cutting across saves a lot. Costs are in "yards walked": time x running speed.
 --
--- All heavy work (building the graph, A*) runs in a coroutine, a few milliseconds per frame,
--- so it never makes the game hitch.
+-- All heavy work (building the graph, the search) runs in a coroutine, a few milliseconds per
+-- frame, so it never makes the game hitch.
 
 local ADDON, ns = ...
 local HBD = LibStub("HereBeDragons-2.0")
@@ -20,6 +26,14 @@ local SWIM_FACTOR = 1.5
 local HOP_FACTOR = 1.4      -- jumping between neighbouring tracks
 local HOP_MAX = 12          -- yards
 local START_RADIUS = 80     -- yards: how far away a path may start
+local LINK_RADIUS = 120     -- yards: flight masters and docks are joined to paths this close
+local RUN = 7               -- yards a second on foot: turns seconds into yards walked
+local FLIGHT_SPEED = 30     -- yards a second along a flight's path
+local FLIGHT_STOP = 2       -- seconds per hop on top (taking off, landing)
+local FLIGHT_CURVE = 1.4    -- unknown flight: this many times the straight line
+local BOARD = 15            -- seconds: talking to the flight master, taking off
+local LAND = 3              -- seconds: landing, getting off
+local RIDE = { boat = 170, zeppelin = 170, portal = 10 }   -- seconds: waiting plus crossing
 local SIMPLIFY = 2          -- yards, route simplification
 local LOOKAHEAD = 20        -- yards: the arrow points this far ahead along the route
 local OFF_ROUTE = 35        -- yards away from the route ...
@@ -28,8 +42,9 @@ local REROUTE_MIN = 3       -- seconds between plans
 local GRAPH_MAX_AGE = 30    -- seconds: rebuild the graph for new data at most this often
 local BUDGET_MS = 3         -- work per frame
 local TICK = 0.1
+local H_FACTOR = RUN / FLIGHT_SPEED   -- cheapest cost per yard (flying): keeps A* exact
 
-local floor, sqrt, abs, huge, pi = math.floor, math.sqrt, math.abs, math.huge, math.pi
+local floor, sqrt, abs, huge, pi, min, max = math.floor, math.sqrt, math.abs, math.huge, math.pi, math.min, math.max
 local atan2 = math.atan2 or math.atan
 
 local function Clock()
@@ -45,8 +60,8 @@ local function MaybeYield()
     end
 end
 
-local function GridKey(cx, cy)
-    return (cx + 5000) * 10000 + (cy + 5000)
+local function GridKey(inst, cx, cy)
+    return inst * 100000000 + (cx + 5000) * 10000 + (cy + 5000)
 end
 local PAIR = 1048576
 local function Dist(x1, y1, x2, y2)
@@ -59,82 +74,185 @@ end
 
 local graph
 
-local function BuildGraph(inst, w)
-    local g = {inst = inst, w = w, rev = ns.rev, built = GetTime(),
-        X = {}, Y = {}, CX = {}, CY = {}, id = {}, grid = {}, to = {}, cost = {}}
-    local X, Y, id, grid, to, cost = g.X, g.Y, g.id, g.grid, g.to, g.cost
+local function BuildGraph()
+    local g = {rev = ns.rev, trev = ns.transportRev, worlds = PadvinderDB.worlds, built = GetTime(),
+        X = {}, Y = {}, I = {}, air = {}, grid = {}, to = {}, cost = {}, tag = {}, trans = {}}
+    local X, Y, I, grid, to, cost, tag = g.X, g.Y, g.I, g.grid, g.to, g.cost, g.tag
     local n = 0
-    for key in pairs(w.cells) do
+    local function NewNode(x, y, inst)
         n = n + 1
-        local cx, cy = key:match("^(-?%d+):(-?%d+)$")
-        cx, cy = tonumber(cx), tonumber(cy)
-        id[key] = n
-        X[n], Y[n] = ns.CellPos(w, key)
-        g.CX[n], g.CY[n] = cx, cy
-        grid[GridKey(cx, cy)] = n
+        X[n], Y[n], I[n] = x, y, inst
         to[n], cost[n] = {}, {}
-        if n % 200 == 0 then MaybeYield() end
+        return n
     end
-    g.n = n
-
-    local function Link(a, b, c)
-        local t = to[a]
-        t[#t + 1] = b
-        cost[a][#t] = c
-    end
-
-    -- recorded connections
-    local edges, drops, fight, swim = w.edges, w.drops, w.fight, w.swim
-    local linked, dropPair = {}, {}
-    local k = 0
-    for ek, count in pairs(edges) do
-        local ka, kb = ns.SplitEdge(ek)
-        local a, b = id[ka], id[kb]
-        local rk = kb .. ">" .. ka
-        local reverse = edges[rk]
-        if a and b and (not reverse or ka < kb) then
-            local travel = count - (fight[ek] or 0) + (reverse and (reverse - (fight[rk] or 0)) or 0)
-            local f = travel <= 0 and GRIND_FACTOR or 1
-            if swim[ka] or swim[kb] then f = f * SWIM_FACTOR end
-            local c = Dist(X[a], Y[a], X[b], Y[b]) * f
-            Link(a, b, c)
-            if reverse or not drops[ek] then
-                Link(b, a, c)
-            else
-                dropPair[a * PAIR + b] = true   -- fell from a down to b
-            end
-            linked[a * PAIR + b], linked[b * PAIR + a] = true, true
+    local function Link(a, b, c, t)
+        local list = to[a]
+        local k = #list + 1
+        list[k] = b
+        cost[a][k] = c
+        if t then
+            tag[a] = tag[a] or {}
+            tag[a][k] = t
         end
-        k = k + 1
-        if k % 200 == 0 then MaybeYield() end
     end
 
-    -- hops between nearby, unconnected cells (parallel tracks)
-    local CX, CY = g.CX, g.CY
-    for i = 1, n do
-        local cx, cy = CX[i], CY[i]
-        for dx = -2, 2 do
-            for dy = -2, 2 do
-                local j = grid[GridKey(cx + dx, cy + dy)]
-                if j and j ~= i and not linked[i * PAIR + j] and not dropPair[j * PAIR + i] then
+    -- recorded cells
+    local cellNode = {}   -- [inst][key] = node
+    for inst, w in pairs(PadvinderDB.worlds) do
+        local ids = {}
+        cellNode[inst] = ids
+        local k = 0
+        for key in pairs(w.cells) do
+            local cx, cy = key:match("^(-?%d+):(-?%d+)$")
+            local x, y = ns.CellPos(w, key)
+            local v = NewNode(x, y, inst)
+            ids[key] = v
+            grid[GridKey(inst, tonumber(cx), tonumber(cy))] = v
+            k = k + 1
+            if k % 200 == 0 then MaybeYield() end
+        end
+    end
+
+    -- recorded connections and hops, per world
+    for inst, w in pairs(PadvinderDB.worlds) do
+        local id = cellNode[inst]
+        local edges, drops, fight, swim = w.edges, w.drops, w.fight, w.swim
+        local linked, dropPair = {}, {}
+        local k = 0
+        for ek, count in pairs(edges) do
+            local ka, kb = ns.SplitEdge(ek)
+            local a, b = id[ka], id[kb]
+            local rk = kb .. ">" .. ka
+            local reverse = edges[rk]
+            if a and b and (not reverse or ka < kb) then
+                local travel = count - (fight[ek] or 0) + (reverse and (reverse - (fight[rk] or 0)) or 0)
+                local f = travel <= 0 and GRIND_FACTOR or 1
+                if swim[ka] or swim[kb] then f = f * SWIM_FACTOR end
+                local c = Dist(X[a], Y[a], X[b], Y[b]) * f
+                Link(a, b, c)
+                if reverse or not drops[ek] then
+                    Link(b, a, c)
+                else
+                    dropPair[a * PAIR + b] = true   -- fell from a down to b
+                end
+                linked[a * PAIR + b], linked[b * PAIR + a] = true, true
+            end
+            k = k + 1
+            if k % 200 == 0 then MaybeYield() end
+        end
+        k = 0
+        for key, i in pairs(id) do
+            local cx, cy = key:match("^(-?%d+):(-?%d+)$")
+            cx, cy = tonumber(cx), tonumber(cy)
+            for dx = -2, 2 do
+                for dy = -2, 2 do
+                    local j = grid[GridKey(inst, cx + dx, cy + dy)]
                     -- (no hop i -> j when you once fell from j down to i: that's a climb)
-                    local d = Dist(X[i], Y[i], X[j], Y[j])
-                    if d <= HOP_MAX then Link(i, j, d * HOP_FACTOR) end
+                    if j and j ~= i and not linked[i * PAIR + j] and not dropPair[j * PAIR + i] then
+                        local d = Dist(X[i], Y[i], X[j], Y[j])
+                        if d <= HOP_MAX then Link(i, j, d * HOP_FACTOR) end
+                    end
+                end
+            end
+            k = k + 1
+            if k % 100 == 0 then MaybeYield() end
+        end
+    end
+
+    -- flight points: ground node (the flight master) and air node
+    local trans = g.trans
+    local airById, nodes = {}, ns.FlightNodes and ns.FlightNodes() or {}
+    for _, f in ipairs(nodes) do
+        local ground = NewNode(f.x, f.y, f.inst)
+        local air = NewNode(f.x, f.y, f.inst)
+        g.air[air] = true
+        Link(ground, air, BOARD * RUN, {kind = "board", node = f})
+        Link(air, ground, LAND * RUN, {kind = "land", node = f})
+        airById[f.id] = air
+        trans[#trans + 1] = ground
+    end
+    local FLY = {kind = "fly"}
+    local flown, known = ns.TAXI_FLOWN or {}, {}
+    for i = 1, #flown - 2, 3 do
+        local a, b, yards = flown[i], flown[i + 1], flown[i + 2]
+        known[a], known[b] = true, true
+        if airById[a] and airById[b] then
+            Link(airById[a], airById[b], (yards / FLIGHT_SPEED + FLIGHT_STOP) * RUN, FLY)
+        end
+    end
+    for _, f in ipairs(nodes) do
+        local a = airById[f.id]
+        -- flight points WoW Forever added: guess flights to the two nearest
+        if not known[f.id] then
+            local near = {}
+            for _, o in ipairs(nodes) do
+                if o ~= f and o.inst == f.inst then
+                    near[#near + 1] = {o, Dist(f.x, f.y, o.x, o.y)}
+                end
+            end
+            table.sort(near, function(p, q) return p[2] < q[2] end)
+            for j = 1, min(2, #near) do
+                local o, d = near[j][1], near[j][2]
+                local c = (d * FLIGHT_CURVE / FLIGHT_SPEED + FLIGHT_STOP) * RUN
+                Link(a, airById[o.id], c, FLY)
+                Link(airById[o.id], a, c, FLY)
+            end
+        end
+        -- flights timed before (they may change gryphons on the way)
+        if ns.FlightTime then
+            for _, o in ipairs(nodes) do
+                local t = o ~= f and ns.FlightTime(f.name, o.name)
+                if t then Link(a, airById[o.id], t * RUN, FLY) end
+            end
+        end
+    end
+
+    -- boats, zeppelins, portals
+    for _, r in ipairs(ns.Rides and ns.Rides() or {}) do
+        local from = NewNode(r.fx, r.fy, r.finst)
+        local dest = NewNode(r.tx, r.ty, r.tinst)
+        Link(from, dest, (RIDE[r.kind] or 170) * RUN, {kind = "ride", ride = r})
+        trans[#trans + 1] = from
+        trans[#trans + 1] = dest
+    end
+
+    -- flight masters and docks: walk off-road to paths and to each other
+    local r = floor(LINK_RADIUS / ns.CELL) + 1
+    for _, t in ipairs(trans) do
+        local inst, tx, ty = I[t], X[t], Y[t]
+        local cx, cy = floor(tx / ns.CELL), floor(ty / ns.CELL)
+        for dx = -r, r do
+            for dy = -r, r do
+                local v = grid[GridKey(inst, cx + dx, cy + dy)]
+                if v then
+                    local d = Dist(tx, ty, X[v], Y[v])
+                    if d <= LINK_RADIUS then
+                        Link(t, v, d * OFFROAD)
+                        Link(v, t, d * OFFROAD)
+                    end
                 end
             end
         end
-        if i % 100 == 0 then MaybeYield() end
+        for _, o in ipairs(trans) do
+            if o ~= t and I[o] == inst then
+                local d = Dist(tx, ty, X[o], Y[o])
+                if d <= LINK_RADIUS then Link(t, o, d * OFFROAD) end
+            end
+        end
+        MaybeYield()
     end
+    g.n = n
     return g
 end
 
 ---------------------------------------------------------------------------------------------
--- A*
+-- Search
 
--- Returns the route points (world yards) from (sx, sy) to (tx, ty), or nil.
-local function FindPath(g, sx, sy, tx, ty)
-    local X, Y, to, cost, grid = g.X, g.Y, g.to, g.cost, g.grid
-    local gScore, came, closed = {}, {}, {}
+-- Returns the legs of the best way from (sx, sy, sinst) to (tx, ty, tinst), or nil:
+-- {{kind = "walk"|"air", inst, x = {}, y = {}, action = {...} for the step after a walk}}
+local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
+    local X, Y, I, to, cost, tag, grid, air = g.X, g.Y, g.I, g.to, g.cost, g.tag, g.grid, g.air
+    local gScore, came, via, closed = {}, {}, {}, {}
     local hf, hn, size = {}, {}, 0   -- binary min-heap of (f, node)
 
     local function Push(f, v)
@@ -167,26 +285,37 @@ local function FindPath(g, sx, sy, tx, ty)
         end
         return f, v
     end
+    local function H(v)
+        if I[v] ~= tinst then return 0 end
+        return Dist(X[v], Y[v], tx, ty) * H_FACTOR
+    end
+    local function Reach(v, gs, from, t)
+        if gs < (gScore[v] or huge) then
+            gScore[v], came[v], via[v] = gs, from, t
+            Push(gs + H(v), v)
+        end
+    end
 
-    -- straight there is always possible
-    local best, bestFrom = OFFROAD * Dist(sx, sy, tx, ty), 0
+    -- straight there (same continent only)
+    local best, bestFrom = huge, nil
+    if sinst == tinst then best, bestFrom = OFFROAD * Dist(sx, sy, tx, ty), 0 end
 
-    -- walk off-road to any recorded cell near the start
+    -- walk off-road to recorded cells, flight masters and docks near the start
     local r = floor(START_RADIUS / ns.CELL) + 1
     local scx, scy = floor(sx / ns.CELL), floor(sy / ns.CELL)
     for dx = -r, r do
         for dy = -r, r do
-            local v = grid[GridKey(scx + dx, scy + dy)]
+            local v = grid[GridKey(sinst, scx + dx, scy + dy)]
             if v then
                 local d = Dist(sx, sy, X[v], Y[v])
-                if d <= START_RADIUS then
-                    local gs = d * OFFROAD
-                    if gs < (gScore[v] or huge) then
-                        gScore[v], came[v] = gs, 0
-                        Push(gs + Dist(X[v], Y[v], tx, ty), v)
-                    end
-                end
+                if d <= START_RADIUS then Reach(v, d * OFFROAD, 0) end
             end
+        end
+    end
+    for _, t in ipairs(g.trans) do
+        if I[t] == sinst then
+            local d = Dist(sx, sy, X[t], Y[t])
+            if d <= LINK_RADIUS then Reach(t, d * OFFROAD, 0) end
         end
     end
 
@@ -197,41 +326,66 @@ local function FindPath(g, sx, sy, tx, ty)
         if not closed[u] then
             closed[u] = true
             local gu = gScore[u]
-            local xu, yu = X[u], Y[u]
-            -- leave the paths here and walk straight to the goal
-            local c = gu + OFFROAD * Dist(xu, yu, tx, ty)
-            if c < best then best, bestFrom = c, u end
-            local tu, cu = to[u], cost[u]
+            -- leave here and walk straight to the goal
+            if I[u] == tinst and not air[u] then
+                local c = gu + OFFROAD * Dist(X[u], Y[u], tx, ty)
+                if c < best then best, bestFrom = c, u end
+            end
+            local tu, cu, tg = to[u], cost[u], tag[u]
             for i = 1, #tu do
-                local v = tu[i]
-                local ng = gu + cu[i]
-                if ng < (gScore[v] or huge) then
-                    gScore[v], came[v] = ng, u
-                    Push(ng + Dist(X[v], Y[v], tx, ty), v)
-                end
+                Reach(tu[i], gu + cu[i], u, tg and tg[i])
             end
         end
         k = k + 1
         if k % 100 == 0 then MaybeYield() end
     end
+    if not bestFrom then return nil end
 
-    -- walk back from the last path cell
+    -- walk back from where the route leaves for the goal
     local nodes = {}
     local v = bestFrom
     while v and v ~= 0 do
         nodes[#nodes + 1] = v
         v = came[v]
     end
-    local xs, ys = {sx}, {sy}
+
+    local legs = {}
+    local leg = {kind = "walk", inst = sinst, x = {sx}, y = {sy}}
+    legs[1] = leg
     for i = #nodes, 1, -1 do
-        xs[#xs + 1], ys[#ys + 1] = X[nodes[i]], Y[nodes[i]]
+        local v = nodes[i]
+        local t = via[v]
+        if not t then
+            leg.x[#leg.x + 1], leg.y[#leg.y + 1] = X[v], Y[v]
+        elseif t.kind == "board" then
+            leg.action = {kind = "flight", from = t.node.short}
+            leg = {kind = "air", inst = I[v], x = {X[v]}, y = {Y[v]}}
+            legs[#legs + 1] = leg
+        elseif t.kind == "fly" then
+            leg.x[#leg.x + 1], leg.y[#leg.y + 1] = X[v], Y[v]
+        elseif t.kind == "land" then
+            for j = #legs, 1, -1 do
+                local a = legs[j].action
+                if a and a.kind == "flight" and not a.to then a.to = t.node.short break end
+            end
+            leg = {kind = "walk", inst = I[v], x = {X[v]}, y = {Y[v]}}
+            legs[#legs + 1] = leg
+        elseif t.kind == "ride" then
+            local ride = t.ride
+            leg.action = {kind = ride.kind, to = ride.toName}
+            if ride.finst == ride.tinst then
+                legs[#legs + 1] = {kind = "air", inst = I[v], x = {ride.fx, ride.tx}, y = {ride.fy, ride.ty}}
+            end
+            leg = {kind = "walk", inst = I[v], x = {X[v]}, y = {Y[v]}}
+            legs[#legs + 1] = leg
+        end
     end
-    xs[#xs + 1], ys[#ys + 1] = tx, ty
-    return xs, ys, #nodes
+    leg.x[#leg.x + 1], leg.y[#leg.y + 1] = tx, ty
+    return legs, #nodes
 end
 
--- Douglas-Peucker for the route (same idea as Segments.lua, on a plain list).
-local function SimplifyRoute(xs, ys, tol)
+-- Douglas-Peucker for a route leg (same idea as Segments.lua, on a plain list).
+local function SimplifyLeg(xs, ys, tol)
     local n = #xs
     if n <= 2 then return xs, ys end
     local keep = {[1] = true, [n] = true}
@@ -279,8 +433,10 @@ local offSince
 local segIdx = 1
 local targetX, targetY, remaining
 local hijacked = false
+local landed = false
 
--- The current route: ns.route = {x = {}, y = {}, cum = {}, n, inst}; ns.routeRev bumps on change.
+-- The current route (ns.route): the leg being walked now (x, y, cum, n, inst, action) and all
+-- legs for drawing (legs). ns.routeRev bumps on change.
 ns.routeRev = 0
 
 local function SetRoute(route)
@@ -290,35 +446,37 @@ local function SetRoute(route)
     targetX, targetY, remaining = nil, nil, nil
 end
 
+local function Busy()
+    return UnitOnTaxi("player") or ns.onTransport
+end
+
 local function Plan()
     if not goal then return end
     local x, y, inst = HBD:GetPlayerWorldPosition()
-    if not x or inst ~= goal.inst then
-        planInst = inst
-        SetRoute(nil)
-        return
-    end
+    if not x then return end
     lastPlan = GetTime()
     planX, planY, planInst = x, y, inst
     offSince = nil
     local g0 = goal
     job = coroutine.create(function()
-        local w = PadvinderDB.worlds[inst]
-        if not w then SetRoute(nil) return end
-        if not graph or graph.inst ~= inst or graph.w ~= w
+        if not graph or graph.worlds ~= PadvinderDB.worlds or graph.trev ~= ns.transportRev
             or (graph.rev ~= ns.rev and GetTime() - graph.built > GRAPH_MAX_AGE) then
-            graph = BuildGraph(inst, w)
+            graph = BuildGraph()
         end
-        local xs, ys, roadNodes = FindPath(graph, x, y, g0.x, g0.y)
+        local legs, nodeCount = FindPath(graph, x, y, inst, g0.x, g0.y, g0.inst)
         if goal ~= g0 then return end   -- target changed meanwhile
-        if roadNodes == 0 then
-            SetRoute(nil)   -- straight there is best: TomTom's own arrow does that
+        if not legs or (nodeCount == 0 and #legs == 1) then
+            SetRoute(nil)   -- no way, or straight there is best: TomTom's own arrow does that
             return
         end
-        xs, ys = SimplifyRoute(xs, ys, SIMPLIFY)
+        for _, leg in ipairs(legs) do
+            if leg.kind == "walk" then leg.x, leg.y = SimplifyLeg(leg.x, leg.y, SIMPLIFY) end
+        end
+        local first = legs[1]
         local cum = {0}
-        for i = 2, #xs do cum[i] = cum[i - 1] + Dist(xs[i - 1], ys[i - 1], xs[i], ys[i]) end
-        SetRoute({x = xs, y = ys, cum = cum, n = #xs, inst = inst})
+        for i = 2, #first.x do cum[i] = cum[i - 1] + Dist(first.x[i - 1], first.y[i - 1], first.x[i], first.y[i]) end
+        SetRoute({x = first.x, y = first.y, cum = cum, n = #first.x, inst = first.inst,
+            action = first.action, legs = legs})
     end)
 end
 
@@ -339,7 +497,7 @@ end
 local function Progress(route, x, y)
     local xs, ys, cum = route.x, route.y, route.cum
     local bestD, bestI, bestT = huge, segIdx, 0
-    for i = math.max(1, segIdx - 1), math.min(route.n - 1, segIdx + 8) do
+    for i = max(1, segIdx - 1), min(route.n - 1, segIdx + 8) do
         local x1, y1 = xs[i], ys[i]
         local dx, dy = xs[i + 1] - x1, ys[i + 1] - y1
         local len2 = dx * dx + dy * dy
@@ -357,6 +515,14 @@ function ns.RouteStart()
     return segIdx
 end
 
+local function ActionText(action)
+    if not action then return nil end
+    if action.kind == "flight" then return "Fly to " .. (action.to or "?") end
+    if action.kind == "portal" then return "Take the portal to " .. action.to end
+    return "Take the " .. action.kind .. " to " .. action.to
+end
+local WHERE = {flight = "to the flight master", boat = "to the boat", zeppelin = "to the zeppelin", portal = "to the portal"}
+
 ---------------------------------------------------------------------------------------------
 -- TomTom's arrow
 
@@ -369,11 +535,16 @@ end
 
 local function ArrowColor(angle)
     -- green straight ahead, yellow sideways, red behind
-    local a = abs(angle)
+    local a = abs(angle) % (2 * pi)
     if a > pi then a = 2 * pi - a end
     local p = 1 - a / pi
     if p > 0.5 then return 2 - 2 * p, 1, 0 end
     return 1, 2 * p, 0
+end
+
+local function Distance(yards)
+    yards = floor(yards + 0.5)
+    return TomTom.GetFormattedDistance and TomTom:GetFormattedDistance(yards) or ("%d yards"):format(yards)
 end
 
 local textElapsed = 0
@@ -388,9 +559,13 @@ local function ArrowOnUpdate(_, elapsed)
     textElapsed = textElapsed + (elapsed or 0)
     if textElapsed < 0.2 then return end
     textElapsed = 0
-    local dist = remaining or 0
-    local text = TomTom.GetFormattedDistance and TomTom:GetFormattedDistance(dist) or ("%d yards"):format(floor(dist + 0.5))
-    TomTom:SetCrazyArrowTitle(goal and goal.title or "Waypoint", text .. " |cff66ccffvia paths|r", "")
+    local route = ns.route
+    local action = route and route.action
+    if action then
+        TomTom:SetCrazyArrowTitle(ActionText(action), Distance(remaining or 0) .. " " .. WHERE[action.kind], "")
+    else
+        TomTom:SetCrazyArrowTitle(goal and goal.title or "Waypoint", Distance(remaining or 0) .. " |cff66ccffvia paths|r", "")
+    end
 end
 
 local function CanHijack()
@@ -414,8 +589,12 @@ local function Update()
         end
     end
 
-    local route = ns.route
     if not PadvinderDB.routing or not goal then
+        Release()
+        return
+    end
+    -- in the air or on a boat: TomTom's own arrow until we're back on our feet
+    if Busy() then
         Release()
         return
     end
@@ -424,22 +603,30 @@ local function Update()
         Release()
         return
     end
+    local now = GetTime()
+    local route = ns.route
+
+    -- just landed or got off: plan the rest of the way
+    if landed or (route and inst ~= route.inst) then
+        if not job and now - lastPlan > 1 then
+            landed = false
+            Plan()
+        end
+        Release()
+        return
+    end
+
     if not route then
         Release()
-        -- no route (other continent, or straight was best): try again after a change
-        if not job and GetTime() - lastPlan > REROUTE_MIN
+        -- no route (no way known, or straight was best): try again after a change
+        if not job and now - lastPlan > REROUTE_MIN
             and (inst ~= planInst or Dist(x, y, planX or x, planY or y) > 100) then
             Plan()
         end
         return
     end
-    if inst ~= route.inst then
-        Release()
-        return
-    end
 
     local along, off = Progress(route, x, y)
-    local now = GetTime()
     if off > OFF_ROUTE then
         offSince = offSince or now
         if now - offSince > OFF_ROUTE_TIME and now - lastPlan > REROUTE_MIN and not job then Plan() end
@@ -450,14 +637,18 @@ local function Update()
     remaining = route.cum[route.n] - along + off
     targetX, targetY = PointAt(route, along + LOOKAHEAD)
 
-    -- On the last straight stretch the route is the straight line: TomTom's own arrow (with
-    -- its arrival animation) does that best.
-    if segIdx >= route.n - 1 then
+    -- On the last straight stretch to the goal the route is the straight line: TomTom's own arrow
+    -- (with its arrival animation) does that best. Not when a flight or boat comes next.
+    if segIdx >= route.n - 1 and not route.action then
         Release()
     elseif not hijacked and CanHijack() then
         hijacked = true
         TomTom:HijackCrazyArrow(ArrowOnUpdate)
     end
+end
+
+function ns.OnLanded()
+    landed = true
 end
 
 local function OnTarget(_, uid)
@@ -470,7 +661,7 @@ local function OnTarget(_, uid)
     local wx, wy, inst = HBD:GetWorldCoordinatesFromZone(uid[2], uid[3], uid[1])
     if not wx then return end
     goal = {x = wx, y = wy, inst = inst, title = uid.title}
-    Plan()
+    if not Busy() then Plan() end
 end
 
 function ns.SetRouting(on)
@@ -493,9 +684,13 @@ function ns.RouteInfo()
     elseif job then
         return "planning..."
     elseif ns.route and remaining then
+        local action = ns.route.action
+        if action then
+            return ("%s, %d yards %s"):format(ActionText(action), floor(remaining + 0.5), WHERE[action.kind])
+        end
         return ("%d yards via paths"):format(floor(remaining + 0.5))
     elseif goal then
-        return "straight line (no better way over paths)"
+        return "straight line (no better way known)"
     end
     return "no waypoint"
 end

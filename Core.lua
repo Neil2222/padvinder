@@ -22,6 +22,8 @@ local FALL_ONEWAY = 0.9   -- this many seconds falling between two samples = one
 local TICK = 0.1
 local COMBAT_LINGER = 30  -- for this many seconds after combat, walking still counts as grinding (looting, next mob)
 local COMBAT_LEADIN = 15  -- when combat starts, the last this-many seconds of walking count as grinding too (walking up to the mob)
+local TRANSPORT_MARGIN = 3  -- yards/s: moving this much faster than your own speed = standing on a boat/zeppelin
+local TRANSPORT_HOLD = 3    -- seconds: still counts as on a transport after the last sign of it
 
 ns.CELL = CELL
 ns.rev = 0                -- bumped on every data change, so the map knows to redraw
@@ -95,6 +97,21 @@ local lastCombat = -1000
 local fightInStep = false
 local wasInCombat = false
 local recent = {}   -- recent travel steps {t, inst, ek, key}, retagged as grinding when combat starts
+local tickX, tickY, tickInst
+local lastTransport = -1000
+
+-- Standing on a boat or zeppelin: the position moves faster than you do yourself (there is no
+-- API for "on a transport"). ns.onTransport is also used by the route planner.
+local function DetectTransport(x, y, inst, elapsed, now)
+    if tickX and inst == tickInst and elapsed > 0 and GetUnitSpeed then
+        local dx, dy = x - tickX, y - tickY
+        local v = sqrt(dx * dx + dy * dy) / elapsed
+        local own = GetUnitSpeed("player") or 0
+        if v > own + TRANSPORT_MARGIN and v < 200 then lastTransport = now end   -- (200+: teleport)
+    end
+    tickX, tickY, tickInst = x, y, inst
+    ns.onTransport = now - lastTransport < TRANSPORT_HOLD
+end
 
 local function TagFight(w, ek, key)
     w.fight[ek] = (w.fight[ek] or 0) + 1
@@ -131,15 +148,19 @@ local function Start(x, y, inst)
 end
 
 local function Tick(elapsed)
-    if not PadvinderDB.recording then Break() return end
-    if UnitOnTaxi("player") or IsInInstance() then Break() return end
-
     local x, y, inst = HBD:GetPlayerWorldPosition()
-    if not x or not y or not inst then Break() return end
-    if issecretvalue and (issecretvalue(x) or issecretvalue(y)) then Break() return end
+    if not x or not y or not inst or (issecretvalue and (issecretvalue(x) or issecretvalue(y))) then
+        tickX = nil
+        Break()
+        return
+    end
+    local now = GetTime()
+    DetectTransport(x, y, inst, elapsed, now)
+
+    if not PadvinderDB.recording then Break() return end
+    if UnitOnTaxi("player") or IsInInstance() or ns.onTransport then Break() return end
 
     if IsFalling() then fallTime = fallTime + elapsed end
-    local now = GetTime()
     local inCombat = UnitAffectingCombat("player")
     if inCombat then
         lastCombat = now

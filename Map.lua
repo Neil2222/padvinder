@@ -46,23 +46,28 @@ local function DrawRoute()
     local data = mapID and HBD.mapData[mapID]
     local canvas = WorldMapFrame:GetCanvas()
     local width, height = canvas:GetWidth(), canvas:GetHeight()
-    if route and data and data.instance == route.inst and data[1] ~= 0 and data[2] ~= 0 then
+    if route and route.legs and data and data[1] ~= 0 and data[2] ~= 0 then
         local zw, zh, left, top = data[1], data[2], data[3], data[4]
         local thick = ROUTE_THICKNESS / WorldMapFrame.ScrollContainer:GetCanvasScale()
-        local r, g, b, a = ns.ClassColor("route")
-        local rx, ry = route.x, route.y
-        for i = 1, route.n - 1 do
-            routeUsed = routeUsed + 1
-            local line = routeLines[routeUsed]
-            if not line then
-                line = overlay:CreateLine(nil, "OVERLAY", nil, 7)
-                routeLines[routeUsed] = line
+        for _, leg in ipairs(route.legs) do
+            if leg.inst == data.instance then
+                -- walking cyan, flights and boats gold
+                local r, g, b, a = ns.ClassColor(leg.kind == "walk" and "route" or "routeAir")
+                local rx, ry = leg.x, leg.y
+                for i = 1, #rx - 1 do
+                    routeUsed = routeUsed + 1
+                    local line = routeLines[routeUsed]
+                    if not line then
+                        line = overlay:CreateLine(nil, "OVERLAY", nil, 7)
+                        routeLines[routeUsed] = line
+                    end
+                    line:SetStartPoint("TOPLEFT", overlay, (left - rx[i]) / zw * width, -(top - ry[i]) / zh * height)
+                    line:SetEndPoint("TOPLEFT", overlay, (left - rx[i + 1]) / zw * width, -(top - ry[i + 1]) / zh * height)
+                    line:SetThickness(thick)
+                    line:SetColorTexture(r, g, b, a)
+                    line:Show()
+                end
             end
-            line:SetStartPoint("TOPLEFT", overlay, (left - rx[i]) / zw * width, -(top - ry[i]) / zh * height)
-            line:SetEndPoint("TOPLEFT", overlay, (left - rx[i + 1]) / zw * width, -(top - ry[i + 1]) / zh * height)
-            line:SetThickness(thick)
-            line:SetColorTexture(r, g, b, a)
-            line:Show()
         end
     end
     for i = routeUsed + 1, #routeLines do routeLines[i]:Hide() end
