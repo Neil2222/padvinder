@@ -12,14 +12,19 @@
 --  * every boat/zeppelin/portal dock is a node, joined to where the ride lands.
 --  * flight masters and docks are joined to recorded cells near them (walking off-road).
 --  * where you have never been: "probable ground" from QuestieDB's spawns and patrol paths
---    (Walkable.lua), trusted less than your own paths.
+--    (Walkable.lua, worked out once per session), trusted less than your own paths. Those
+--    squares are nodes too (ids above W0); their links come straight from Walkable's lists.
 -- Leaving all of that is allowed but costs more the longer the blind stretch is (Blind): a
--- few yards are fine, a long straight line through unknown land likely runs into a mountain. Costs are in "yards walked": time x running speed.
+-- few yards are fine, a long straight line through unknown land likely runs into a mountain.
+-- Costs are in "yards walked": time x running speed.
 -- Every stretch of a route is marked sure (your own paths) or not (probable or unknown ground);
 -- the map draws the unsure ones dashed and the arrow says "unknown ground".
 --
--- All heavy work (building the graph, the search) runs in a coroutine, a few milliseconds per
--- frame, so it never makes the game hitch.
+-- The graph is kept in flat arrays (compressed rows), and the search estimates the rest of the
+-- way as "walk straight there, or walk to the nearest flight master, fly, and walk from the
+-- flight master nearest the goal", which never overestimates, so the route stays the best one
+-- while the search looks at far fewer nodes. All heavy work runs in a coroutine, a few
+-- milliseconds per frame, so it never makes the game hitch.
 
 local ADDON, ns = ...
 local HBD = LibStub("HereBeDragons-2.0")
@@ -32,8 +37,6 @@ local BLIND_SCALE = 100     -- ... plus 1 for every this many yards of the blind
 local WILD_BASE = 1.2       -- cost factor for a step between squares right next to each other ...
 local WILD_PER_YARD = 1/80  -- ... plus this much per yard of gap
 local PATROL_FACTOR = 1.2   -- along a patrol path (QuestieDB)
-local WALK_LINK = 160       -- yards: probable-ground squares this close can be joined ...
-local WALK_NEAREST = 6      -- ... each to its this many nearest (keeps the graph small)
 local WILD_FACTOR = WILD_BASE + 16 * WILD_PER_YARD   -- joining probable ground to recorded paths
 local JOIN = 16             -- yards: probable ground and recorded paths this close are joined
 local SURE_SHORT = 20       -- yards: a stretch this short counts as sure anyway
@@ -62,7 +65,7 @@ local GRAPH_MAX_AGE = 30    -- seconds: rebuild the graph for new data at most t
 local GRAPH_KEEP = 120      -- seconds without a waypoint: free the graph's memory
 local BUDGET_MS = 3         -- work per frame
 local TICK = 0.1
-local H_FACTOR = RUN / FLIGHT_SPEED   -- cheapest cost per yard (flying): keeps A* exact
+local W0 = 16777216         -- node ids above this are probable-ground squares (W0 + square)
 
 local floor, sqrt, abs, huge, pi, min, max = math.floor, math.sqrt, math.abs, math.huge, math.pi, math.min, math.max
 local atan2 = math.atan2 or math.atan
@@ -95,56 +98,64 @@ end
 
 ---------------------------------------------------------------------------------------------
 -- Graph
+--
+-- Nodes 1..nrec are recorded cells, nrec+1..n flight masters (ground and air) and docks.
+-- Links are in compressed rows: the links of node v are k = off[v] .. off[v + 1] - 1, going to
+-- to[k] at cost[k]; tag[k] marks boarding, flying, landing and rides. Links from probable ground
+-- back into the graph (to cells and flight masters near a square) are in jTo/jCost[square].
 
 local graph
 local idleSince   -- no waypoint since then
 
 local function BuildGraph()
     local g = {rev = ns.rev, trev = ns.transportRev, wrev = ns.walkRev, worlds = PadvinderDB.worlds, built = GetTime(),
-        X = {}, Y = {}, I = {}, air = {}, rec = {}, grid = {}, wgrid = {}, to = {}, cost = {}, tag = {}, trans = {}}
-    local X, Y, I, grid, to, cost, tag = g.X, g.Y, g.I, g.grid, g.to, g.cost, g.tag
+        X = {}, Y = {}, I = {}, air = {}, grid = {}, trans = {}, tag = {}, jTo = {}, jCost = {}}
+    local X, Y, I, grid = g.X, g.Y, g.I, g.grid
     local n = 0
     local function NewNode(x, y, inst)
         n = n + 1
         X[n], Y[n], I[n] = x, y, inst
-        to[n], cost[n] = {}, {}
         return n
     end
+    -- links are collected first, then put in rows
+    local EA, EB, EC, ET, ne = {}, {}, {}, {}, 0
     local function Link(a, b, c, t)
-        local list = to[a]
-        local k = #list + 1
-        list[k] = b
-        cost[a][k] = c
-        if t then
-            tag[a] = tag[a] or {}
-            tag[a][k] = t
-        end
+        ne = ne + 1
+        EA[ne], EB[ne], EC[ne] = a, b, c
+        if t then ET[ne] = t end
+    end
+    local jTo, jCost = g.jTo, g.jCost
+    local function JoinFromWalk(square, v, c)
+        local t = jTo[square]
+        if not t then t = {}; jTo[square] = t; jCost[square] = {} end
+        t[#t + 1] = v
+        jCost[square][#t] = c
     end
 
     -- recorded cells
     local cellNode = {}   -- [inst][key] = node
+    local k = 0
     for inst, w in pairs(PadvinderDB.worlds) do
         local ids = {}
         cellNode[inst] = ids
-        local k = 0
         for key in pairs(w.cells) do
             local cx, cy = key:match("^(-?%d+):(-?%d+)$")
             local x, y = ns.CellPos(w, key)
             local v = NewNode(x, y, inst)
-            g.rec[v] = true
             ids[key] = v
             grid[GridKey(inst, tonumber(cx), tonumber(cy))] = v
             k = k + 1
-            if k % 200 == 0 then MaybeYield() end
+            if k % 300 == 0 then MaybeYield() end
         end
     end
+    g.nrec = n
 
     -- recorded connections and hops, per world
     for inst, w in pairs(PadvinderDB.worlds) do
         local id = cellNode[inst]
         local edges, drops, fight, swim = w.edges, w.drops, w.fight, w.swim
         local linked, dropPair = {}, {}
-        local k = 0
+        k = 0
         for ek, count in pairs(edges) do
             local ka, kb = ns.SplitEdge(ek)
             local a, b = id[ka], id[kb]
@@ -164,7 +175,7 @@ local function BuildGraph()
                 linked[a * PAIR + b], linked[b * PAIR + a] = true, true
             end
             k = k + 1
-            if k % 200 == 0 then MaybeYield() end
+            if k % 300 == 0 then MaybeYield() end
         end
         k = 0
         for key, i in pairs(id) do
@@ -181,83 +192,41 @@ local function BuildGraph()
                 end
             end
             k = k + 1
-            if k % 100 == 0 then MaybeYield() end
+            if k % 150 == 0 then MaybeYield() end
         end
     end
 
-    -- probable ground (QuestieDB): squares, their neighbours, patrol paths, and joins with paths
+    -- recorded cells and probable ground close together: joined both ways
+    local walk = ns.walk
     local WC = ns.WALK_CELL or 32
-    for inst, wl in pairs(ns.walk or {}) do
-        local node, wmap = {}, {}
-        g.wgrid[inst] = wmap
-        for i = 1, wl.n do
-            local v = NewNode(wl.X[i], wl.Y[i], inst)
-            node[i] = v
-            wmap[ns.WalkKey(wl.CX[i], wl.CY[i])] = v
-            if i % 300 == 0 then MaybeYield() end
-        end
-        local WX, WY, WCX, WCY, wgridl = wl.X, wl.Y, wl.CX, wl.CY, wl.grid
-        local reach = floor(WALK_LINK / WC) + 1
-        local candJ, candD = {}, {}
-        for i = 1, wl.n do
-            local cx, cy = WCX[i], WCY[i]
-            -- the nearest squares around this one, joined both ways
-            local nc = 0
-            for dx = -reach, reach do
-                for dy = -reach, reach do
-                    local j = wgridl[ns.WalkKey(cx + dx, cy + dy)]
-                    if j and j ~= i then
-                        local d = Dist(WX[i], WY[i], WX[j], WY[j])
-                        if d <= WALK_LINK then
-                            nc = nc + 1
-                            candJ[nc], candD[nc] = j, d
+    if walk then
+        local WX, WY, wgrid = walk.X, walk.Y, walk.grid
+        for v = 1, g.nrec do
+            local wmap = wgrid[I[v]]
+            if wmap then
+                local x, y = X[v], Y[v]
+                local wcx, wcy = floor(x / WC), floor(y / WC)
+                for dx = -1, 1 do
+                    for dy = -1, 1 do
+                        local s = wmap[ns.WalkKey(wcx + dx, wcy + dy)]
+                        if s then
+                            local d = Dist(x, y, WX[s], WY[s])
+                            if d <= JOIN then
+                                Link(v, W0 + s, d * WILD_FACTOR)
+                                JoinFromWalk(s, v, d * WILD_FACTOR)
+                            end
                         end
                     end
                 end
             end
-            for _ = 1, min(WALK_NEAREST, nc) do
-                local best = 1
-                for c = 2, nc do
-                    if candD[c] < candD[best] then best = c end
-                end
-                local j, d = candJ[best], candD[best]
-                candD[best] = huge
-                local f = WILD_BASE + d * WILD_PER_YARD
-                if d * f < Blind(d) then
-                    Link(node[i], node[j], d * f)
-                    Link(node[j], node[i], d * f)
-                end
-            end
-            -- join with recorded cells close by
-            local rcx, rcy = floor(WX[i] / ns.CELL), floor(WY[i] / ns.CELL)
-            local rr = floor(JOIN / ns.CELL) + 1
-            for dx = -rr, rr do
-                for dy = -rr, rr do
-                    local v = grid[GridKey(inst, rcx + dx, rcy + dy)]
-                    if v then
-                        local d = Dist(WX[i], WY[i], X[v], Y[v])
-                        if d <= JOIN then
-                            Link(node[i], v, d * WILD_FACTOR)
-                            Link(v, node[i], d * WILD_FACTOR)
-                        end
-                    end
-                end
-            end
-            if i % 100 == 0 then MaybeYield() end
+            if v % 300 == 0 then MaybeYield() end
         end
-        local pt = wl.patrol
-        for k = 1, #pt - 1, 2 do
-            local a, b = pt[k], pt[k + 1]
-            local d = Dist(WX[a], WY[a], WX[b], WY[b])
-            Link(node[a], node[b], d * PATROL_FACTOR)
-            Link(node[b], node[a], d * PATROL_FACTOR)
-        end
-        MaybeYield()
     end
 
     -- flight points: ground node (the flight master) and air node
     local trans = g.trans
     local airById, nodes = {}, ns.FlightNodes and ns.FlightNodes() or {}
+    g.fm = {}
     for _, f in ipairs(nodes) do
         local ground = NewNode(f.x, f.y, f.inst)
         local air = NewNode(f.x, f.y, f.inst)
@@ -266,6 +235,7 @@ local function BuildGraph()
         Link(air, ground, LAND * RUN, {kind = "land", node = f})
         airById[f.id] = air
         trans[#trans + 1] = ground
+        g.fm[#g.fm + 1] = ground
     end
     local FLY = {kind = "fly"}
     local flown, known = ns.TAXI_FLOWN or {}, {}
@@ -312,8 +282,9 @@ local function BuildGraph()
         trans[#trans + 1] = dest
     end
 
-    -- flight masters and docks: walk off-road to paths and to each other
+    -- flight masters and docks: walk off-road to paths, probable ground and each other
     local r = floor(LINK_RADIUS / ns.CELL) + 1
+    local wr = floor(LINK_RADIUS / WC) + 1
     for _, t in ipairs(trans) do
         local inst, tx, ty = I[t], X[t], Y[t]
         local cx, cy = floor(tx / ns.CELL), floor(ty / ns.CELL)
@@ -329,6 +300,22 @@ local function BuildGraph()
                 end
             end
         end
+        local wmap = walk and walk.grid[inst]
+        if wmap then
+            local wcx, wcy = floor(tx / WC), floor(ty / WC)
+            for dx = -wr, wr do
+                for dy = -wr, wr do
+                    local s = wmap[ns.WalkKey(wcx + dx, wcy + dy)]
+                    if s then
+                        local d = Dist(tx, ty, walk.X[s], walk.Y[s])
+                        if d <= LINK_RADIUS then
+                            Link(t, W0 + s, Blind(d))
+                            JoinFromWalk(s, t, Blind(d))
+                        end
+                    end
+                end
+            end
+        end
         for _, o in ipairs(trans) do
             if o ~= t and I[o] == inst then
                 local d = Dist(tx, ty, X[o], Y[o])
@@ -338,6 +325,30 @@ local function BuildGraph()
         MaybeYield()
     end
     g.n = n
+
+    -- put the links in rows (counting sort by source node)
+    local off, to, cost, tag = {}, {}, {}, g.tag
+    local count = {}
+    for v = 1, n + 1 do count[v] = 0 end
+    for e = 1, ne do count[EA[e]] = count[EA[e]] + 1 end
+    local pos = 1
+    for v = 1, n do
+        off[v] = pos
+        pos = pos + count[v]
+        count[v] = off[v]
+    end
+    off[n + 1] = pos
+    MaybeYield()
+    for e = 1, ne do
+        local a = EA[e]
+        local p = count[a]
+        count[a] = p + 1
+        to[p], cost[p] = EB[e], EC[e]
+        local t = ET[e]
+        if t then tag[p] = t end
+        if e % 5000 == 0 then MaybeYield() end
+    end
+    g.off, g.to, g.cost = off, to, cost
     return g
 end
 
@@ -347,7 +358,11 @@ end
 -- Returns the legs of the best way from (sx, sy, sinst) to (tx, ty, tinst), or nil:
 -- {{kind = "walk"|"air", inst, x = {}, y = {}, action = {...} for the step after a walk}}
 local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
-    local X, Y, I, to, cost, tag, grid, air = g.X, g.Y, g.I, g.to, g.cost, g.tag, g.grid, g.air
+    local X, Y, I, grid, air = g.X, g.Y, g.I, g.grid, g.air
+    local off, to, cost, tag, jTo, jCost = g.off, g.to, g.cost, g.tag, g.jTo, g.jCost
+    local walk = ns.walk
+    local WX, WY, WI = walk and walk.X, walk and walk.Y, walk and walk.I
+    local woff, wnbr, patrol = walk and walk.off, walk and walk.nbr, walk and walk.patrol
     local gScore, came, via, closed = {}, {}, {}, {}
     local hf, hn, size = {}, {}, 0   -- binary min-heap of (f, node)
 
@@ -381,9 +396,41 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
         end
         return f, v
     end
+    local function Where(v)
+        if v > W0 then
+            local s = v - W0
+            return WX[s], WY[s], WI[s]
+        end
+        return X[v], Y[v], I[v]
+    end
+
+    -- The estimate of the rest of the way (never too high): walking costs at least the straight
+    -- distance; flying costs at least walking to the nearest flight master, boarding, landing,
+    -- and walking from the flight master nearest the goal.
+    local fmX, fmY, nfm, toGoal = {}, {}, 0, huge
+    for _, v in ipairs(g.fm or {}) do
+        if I[v] == tinst then
+            nfm = nfm + 1
+            fmX[nfm], fmY[nfm] = X[v], Y[v]
+            local d = Dist(X[v], Y[v], tx, ty)
+            if d < toGoal then toGoal = d end
+        end
+    end
+    local flyRest = (BOARD + LAND) * RUN + toGoal
     local function H(v)
-        if I[v] ~= tinst then return 0 end
-        return Dist(X[v], Y[v], tx, ty) * H_FACTOR
+        local x, y, inst = Where(v)
+        if inst ~= tinst then return 0 end
+        if air[v] then return LAND * RUN + toGoal end
+        local d = Dist(x, y, tx, ty)
+        if nfm > 0 and d > flyRest then
+            local b = huge
+            for i = 1, nfm do
+                local e = Dist(x, y, fmX[i], fmY[i])
+                if e < b then b = e end
+            end
+            if b + flyRest < d then return b + flyRest end
+        end
+        return d
     end
     local function Reach(v, gs, from, t)
         if gs < (gScore[v] or huge) then
@@ -396,7 +443,7 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
     local best, bestFrom = huge, nil
     if sinst == tinst then best, bestFrom = Blind(Dist(sx, sy, tx, ty)), 0 end
 
-    -- walk off-road to recorded cells, flight masters and docks near the start
+    -- walk off-road to recorded cells, flight masters, docks and probable ground near the start
     local r = floor(START_RADIUS / ns.CELL) + 1
     local scx, scy = floor(sx / ns.CELL), floor(sy / ns.CELL)
     for dx = -r, r do
@@ -414,17 +461,17 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
             if d <= LINK_RADIUS then Reach(t, Blind(d), 0) end
         end
     end
-    local wmap = g.wgrid[sinst]
+    local wmap = walk and walk.grid[sinst]
     if wmap then
         local WC = ns.WALK_CELL or 32
         local wr = floor(START_RADIUS / WC) + 1
         local wcx, wcy = floor(sx / WC), floor(sy / WC)
         for dx = -wr, wr do
             for dy = -wr, wr do
-                local v = wmap[ns.WalkKey(wcx + dx, wcy + dy)]
-                if v then
-                    local d = Dist(sx, sy, X[v], Y[v])
-                    if d <= START_RADIUS then Reach(v, Blind(d), 0) end
+                local s = wmap[ns.WalkKey(wcx + dx, wcy + dy)]
+                if s then
+                    local d = Dist(sx, sy, WX[s], WY[s])
+                    if d <= START_RADIUS then Reach(W0 + s, Blind(d), 0) end
                 end
             end
         end
@@ -437,20 +484,37 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
         if not closed[u] then
             closed[u] = true
             local gu = gScore[u]
+            local ux, uy, uinst = Where(u)
             -- leave here and walk straight to the goal
-            if I[u] == tinst and not air[u] then
-                local c = gu + Blind(Dist(X[u], Y[u], tx, ty))
+            if uinst == tinst and not air[u] then
+                local c = gu + Blind(Dist(ux, uy, tx, ty))
                 if c < best then best, bestFrom = c, u end
             end
-            local tu, cu, tg = to[u], cost[u], tag[u]
-            for i = 1, #tu do
-                Reach(tu[i], gu + cu[i], u, tg and tg[i])
+            if u > W0 then
+                -- probable ground: its neighbours, and back to paths and flight masters near it
+                local s = u - W0
+                for p = woff[s], woff[s + 1] - 1 do
+                    local j = wnbr[p]
+                    local d = Dist(ux, uy, WX[j], WY[j])
+                    local c = patrol[s * PAIR + j] and d * PATROL_FACTOR or d * (WILD_BASE + d * WILD_PER_YARD)
+                    Reach(W0 + j, gu + c, u)
+                end
+                local jt = jTo[s]
+                if jt then
+                    local jc = jCost[s]
+                    for i = 1, #jt do Reach(jt[i], gu + jc[i], u) end
+                end
+            else
+                for p = off[u], off[u + 1] - 1 do
+                    Reach(to[p], gu + cost[p], u, tag[p])
+                end
             end
         end
         k = k + 1
         if k % 100 == 0 then MaybeYield() end
     end
     if not bestFrom then return nil end
+    g.lastExpanded = k
 
     -- walk back from where the route leaves for the goal
     local nodes = {}
@@ -460,6 +524,7 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
         v = came[v]
     end
 
+    local nrec = g.nrec
     local legs = {}
     local leg = {kind = "walk", inst = sinst, x = {sx}, y = {sy}, sure = {}}
     legs[1] = leg
@@ -468,34 +533,35 @@ local function FindPath(g, sx, sy, sinst, tx, ty, tinst)
     local function WalkTo(v, x, y)
         local n = #leg.x
         local short = Dist(leg.x[n], leg.y[n], x, y) <= SURE_SHORT
-        leg.sure[n] = short or (v ~= 0 and prev ~= 0 and g.rec[prev] and g.rec[v]) or false
+        leg.sure[n] = short or (v ~= 0 and prev ~= 0 and prev <= nrec and v <= nrec) or false
         leg.x[n + 1], leg.y[n + 1] = x, y
     end
     for i = #nodes, 1, -1 do
         local v = nodes[i]
         local t = via[v]
+        local vx, vy, vinst = Where(v)
         if not t then
-            WalkTo(v, X[v], Y[v])
+            WalkTo(v, vx, vy)
         elseif t.kind == "board" then
             leg.action = {kind = "flight", from = t.node.short}
-            leg = {kind = "air", inst = I[v], x = {X[v]}, y = {Y[v]}}
+            leg = {kind = "air", inst = vinst, x = {vx}, y = {vy}}
             legs[#legs + 1] = leg
         elseif t.kind == "fly" then
-            leg.x[#leg.x + 1], leg.y[#leg.y + 1] = X[v], Y[v]
+            leg.x[#leg.x + 1], leg.y[#leg.y + 1] = vx, vy
         elseif t.kind == "land" then
             for j = #legs, 1, -1 do
                 local a = legs[j].action
                 if a and a.kind == "flight" and not a.to then a.to = t.node.short break end
             end
-            leg = {kind = "walk", inst = I[v], x = {X[v]}, y = {Y[v]}, sure = {}}
+            leg = {kind = "walk", inst = vinst, x = {vx}, y = {vy}, sure = {}}
             legs[#legs + 1] = leg
         elseif t.kind == "ride" then
             local ride = t.ride
             leg.action = {kind = ride.kind, to = ride.toName}
             if ride.finst == ride.tinst then
-                legs[#legs + 1] = {kind = "air", inst = I[v], x = {ride.fx, ride.tx}, y = {ride.fy, ride.ty}}
+                legs[#legs + 1] = {kind = "air", inst = vinst, x = {ride.fx, ride.tx}, y = {ride.fy, ride.ty}}
             end
-            leg = {kind = "walk", inst = I[v], x = {X[v]}, y = {Y[v]}, sure = {}}
+            leg = {kind = "walk", inst = vinst, x = {vx}, y = {vy}, sure = {}}
             legs[#legs + 1] = leg
         end
         prev = v

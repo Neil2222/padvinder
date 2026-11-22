@@ -2,7 +2,7 @@
 ## Title: Padvinder
 ## Notes: Records the paths you walk, draws them as a heatmap and routes your TomTom arrow over them, flight paths, boats and zeppelins.
 ## Author: Neil & Claude
-## Version: 0.7.1
+## Version: 0.8.0
 ## SavedVariables: PadvinderDB
 ## SavedVariablesPerCharacter: PadvinderCharDB
 ## OptionalDeps: TomTom, ForeverDungeonJournal, QuestieDB
