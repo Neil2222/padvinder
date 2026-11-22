@@ -268,6 +268,15 @@ local function Info()
     if ns.lastLineCount then ns.Print("lines on the map last time it was drawn: " .. ns.lastLineCount) end
     if ns.RouteInfo then ns.Print("route: " .. ns.RouteInfo()) end
     if ns.lastMinimapLineCount then ns.Print("lines on the minimap right now: " .. ns.lastMinimapLineCount) end
+    if ns.walk then
+        local n = 0
+        for _, wl in pairs(ns.walk) do n = n + wl.n end
+        ns.Print(("probable ground (QuestieDB): %d squares"):format(n))
+    end
+    if UpdateAddOnMemoryUsage and GetAddOnMemoryUsage then
+        UpdateAddOnMemoryUsage()
+        ns.Print(("memory: %.1f MB"):format(GetAddOnMemoryUsage(ADDON) / 1024))
+    end
 end
 
 function ns.SetRecording(on)

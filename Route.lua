@@ -59,6 +59,7 @@ local OFF_ROUTE = 35        -- yards away from the route ...
 local OFF_ROUTE_TIME = 2    -- ... for this many seconds: plan again
 local REROUTE_MIN = 3       -- seconds between plans
 local GRAPH_MAX_AGE = 30    -- seconds: rebuild the graph for new data at most this often
+local GRAPH_KEEP = 120      -- seconds without a waypoint: free the graph's memory
 local BUDGET_MS = 3         -- work per frame
 local TICK = 0.1
 local H_FACTOR = RUN / FLIGHT_SPEED   -- cheapest cost per yard (flying): keeps A* exact
@@ -96,6 +97,7 @@ end
 -- Graph
 
 local graph
+local idleSince   -- no waypoint since then
 
 local function BuildGraph()
     local g = {rev = ns.rev, trev = ns.transportRev, wrev = ns.walkRev, worlds = PadvinderDB.worlds, built = GetTime(),
@@ -744,8 +746,12 @@ local function Update()
 
     if not PadvinderDB.routing or not goal then
         Release()
+        -- the graph takes memory (all those cells and squares): let it go when not routing
+        idleSince = idleSince or GetTime()
+        if graph and not job and GetTime() - idleSince > GRAPH_KEEP then graph = nil end
         return
     end
+    idleSince = nil
     -- in the air or on a boat: TomTom's own arrow until we're back on our feet
     if Busy() then
         Release()
