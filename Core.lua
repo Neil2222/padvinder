@@ -22,8 +22,10 @@ local FALL_ONEWAY = 0.9   -- this many seconds falling between two samples = one
 local TICK = 0.1
 local COMBAT_LINGER = 30  -- for this many seconds after combat, walking still counts as grinding (looting, next mob)
 local COMBAT_LEADIN = 15  -- when combat starts, the last this-many seconds of walking count as grinding too (walking up to the mob)
-local TRANSPORT_MARGIN = 3  -- yards/s: moving this much faster than your own speed = standing on a boat/zeppelin
-local TRANSPORT_HOLD = 3    -- seconds: still counts as on a transport after the last sign of it
+local TRANSPORT_FACTOR = 1.5  -- moving faster than this times your own speed ...
+local TRANSPORT_MARGIN = 3    -- ... plus this many yards/s = standing on a boat/zeppelin
+local TRANSPORT_SURE = 1.0    -- seconds: only that fast for this long counts (one odd sample doesn't)
+local TRANSPORT_HOLD = 3      -- seconds: still counts as on a transport after the last sign of it
 
 ns.CELL = CELL
 ns.rev = 0                -- bumped on every data change, so the map knows to redraw
@@ -123,15 +125,34 @@ local lastTransport = -1000
 
 -- Standing on a boat or zeppelin: the position moves faster than you do yourself (there is no
 -- API for "on a transport"). ns.onTransport is also used by the route planner.
+-- Returns true while you move suspiciously fast: such a sample isn't recorded, but recording only
+-- stops (TRANSPORT_HOLD) after TRANSPORT_SURE seconds of it. A single odd sample (a jump, a
+-- knockback, the speed lagging a shapeshift) used to cut 3 seconds out of your path.
+local suspect = 0
+ns.transportStats = {count = 0}
 local function DetectTransport(x, y, inst, elapsed, now)
+    local fast = false
     local own = GetUnitSpeed and Known(GetUnitSpeed("player"))
-    if tickX and inst == tickInst and elapsed > 0 and own then
+    if tickX and inst == tickInst and elapsed > 0 and own and not IsFalling() then
         local dx, dy = x - tickX, y - tickY
         local v = sqrt(dx * dx + dy * dy) / elapsed
-        if v > own + TRANSPORT_MARGIN and v < 200 then lastTransport = now end   -- (200+: teleport)
+        if v > own * TRANSPORT_FACTOR + TRANSPORT_MARGIN and v < 200 then   -- (200+: teleport)
+            fast = true
+            suspect = suspect + elapsed
+            if suspect >= TRANSPORT_SURE then
+                if now - lastTransport >= TRANSPORT_HOLD then
+                    local s = ns.transportStats
+                    s.count, s.v, s.own = s.count + 1, v, own
+                end
+                lastTransport = now
+            end
+        else
+            suspect = 0
+        end
     end
     tickX, tickY, tickInst = x, y, inst
     ns.onTransport = now - lastTransport < TRANSPORT_HOLD
+    return fast
 end
 
 local function TagFight(w, ek, key)
@@ -176,10 +197,11 @@ local function Tick(elapsed)
         return
     end
     local now = GetTime()
-    DetectTransport(x, y, inst, elapsed, now)
+    local fast = DetectTransport(x, y, inst, elapsed, now)
 
     if not PadvinderDB.recording then Break() return end
     if UnitOnTaxi("player") or IsInInstance() or ns.onTransport then Break() return end
+    if fast then return end   -- not sure yet: skip this sample, but keep the path going
 
     if IsFalling() then fallTime = fallTime + elapsed end
     local inCombat = UnitAffectingCombat("player")
@@ -267,6 +289,9 @@ local function Info()
     if not any then ns.Print("nothing recorded yet. Go for a run!") end
     if ns.lastLineCount then ns.Print("lines on the map last time it was drawn: " .. ns.lastLineCount) end
     if ns.RouteInfo then ns.Print("route: " .. ns.RouteInfo()) end
+    local ts = ns.transportStats
+    ns.Print(("boats/zeppelins detected this session: %d%s"):format(ts.count,
+        ts.v and (" (last: moving %d yd/s, own speed %d)"):format(floor(ts.v + 0.5), floor(ts.own + 0.5)) or ""))
     if ns.lastMinimapLineCount then ns.Print("lines on the minimap right now: " .. ns.lastMinimapLineCount) end
     if ns.walk then
         ns.Print(("probable ground (QuestieDB): %d squares"):format(ns.walk.n))
