@@ -179,6 +179,7 @@ local function Tick(elapsed)
             recent[#recent + 1] = {t = now, inst = inst, ek = ek, key = key}
             while recent[1] and now - recent[1].t > COMBAT_LEADIN do table.remove(recent, 1) end
         end
+        if ns.OnNewEdge then ns.OnNewEdge(inst, w, ek, lastKey, key) end
         lastKey = key
         ns.rev = ns.rev + 1
     end

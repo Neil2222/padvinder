@@ -1,5 +1,6 @@
--- Turns the recorded connections of one world into drawable segments, shared by the world map
--- and the minimap: undirected (a walked-both-ways road is one segment), with a colour class.
+-- Turns the recorded connections of one world into drawable segments and polylines, shared by
+-- the world map and the minimap: undirected (a walked-both-ways road is one segment), with a
+-- colour class.
 --
 -- Colour classes: 0..HEAT_STEPS = heat buckets (yellow -> red), "drop" (only ever fallen down,
 -- blue), "fight" (only walked during/just after combat, purple).
@@ -40,67 +41,166 @@ function ns.InMode(isFight, mode)
     return mode == "all" or (mode == "travel" and not isFight) or (mode == "grind" and isFight)
 end
 
+-- Heat of a cell = how often the area around it (3x3 cells) was walked while travelling.
+-- Walking the same road twice rarely hits exactly the same cells, but it does hit the same
+-- neighbourhood.
+local function Heat(w, key, cache)
+    local h = cache and cache[key]
+    if not h then
+        local cells, fightCells = w.cells, w.fightCells
+        local cx, cy = key:match("^(-?%d+):(-?%d+)$")
+        cx, cy = tonumber(cx), tonumber(cy)
+        local sum = 0
+        for i = -1, 1 do
+            for j = -1, 1 do
+                local k = (cx + i) .. ":" .. (cy + j)
+                local c = cells[k]
+                if c then sum = sum + c - (fightCells[k] or 0) end
+            end
+        end
+        h = sum / 3   -- one pass touches ~3 cells in the neighbourhood
+        if cache then cache[key] = h end
+    end
+    return h
+end
+
+-- Colour class and grinding flag of the connection a-b (ek = "a>b", the reverse may exist too).
+local function Classify(w, ek, a, b, cache)
+    local edges, fight = w.edges, w.fight
+    local rk = b .. ">" .. a
+    local reverse = edges[rk]
+    local travel = (edges[ek] or 0) - (fight[ek] or 0) + (reverse and (reverse - (fight[rk] or 0)) or 0)
+    local isFight = travel <= 0
+    if w.drops[ek] and not reverse then return "drop", isFight end
+    if isFight then return "fight", true end
+    return HeatBucket((Heat(w, a, cache) + Heat(w, b, cache)) / 2), false
+end
+
+function ns.ClassifyEdge(w, ek)
+    local a, b = Split(ek)
+    return Classify(w, ek, a, b)
+end
+
 local cache = {}   -- [inst] = segments, rebuilt when ns.rev changes
 
--- Returns {n, a[], b[], cls[], fight[], x1[], y1[], x2[], y2[]} (world yards), or nil.
+-- Returns {n, a[], b[], cls[], fight[]} for one world, or nil.
 function ns.Segments(inst)
     local w = PadvinderDB.worlds[inst]
     if not w then cache[inst] = nil return nil end
     local seg = cache[inst]
-    if seg and seg.rev == ns.rev then return seg end
+    if seg and seg.rev == ns.rev and seg.w == w then return seg end
 
-    local edges, drops, fight = w.edges, w.drops, w.fight
-    local cells, fightCells = w.cells, w.fightCells
-
-    -- Heat of a cell = how often the area around it (3x3 cells) was walked while travelling.
-    -- Walking the same road twice rarely hits exactly the same cells, but it does hit the same
-    -- neighbourhood.
+    local edges = w.edges
     local heatCache = {}
-    local function Travel(k)
-        local c = cells[k]
-        return c and (c - (fightCells[k] or 0)) or 0
-    end
-    local function Heat(key)
-        local h = heatCache[key]
-        if not h then
-            local cx, cy = key:match("^(-?%d+):(-?%d+)$")
-            cx, cy = tonumber(cx), tonumber(cy)
-            local sum = 0
-            for i = -1, 1 do
-                for j = -1, 1 do
-                    sum = sum + Travel((cx + i) .. ":" .. (cy + j))
-                end
-            end
-            h = sum / 3   -- one pass touches ~3 cells in the neighbourhood
-            heatCache[key] = h
-        end
-        return h
-    end
-
-    seg = {rev = ns.rev, a = {}, b = {}, cls = {}, fight = {}, x1 = {}, y1 = {}, x2 = {}, y2 = {}}
+    seg = {rev = ns.rev, w = w, a = {}, b = {}, cls = {}, fight = {}}
     local n = 0
-    for ek, count in pairs(edges) do
+    for ek in pairs(edges) do
         local a, b = Split(ek)
-        local rk = b .. ">" .. a
-        local reverse = edges[rk]
-        if not reverse or a < b then
-            local travel = count - (fight[ek] or 0) + (reverse and (reverse - (fight[rk] or 0)) or 0)
-            local isFight = travel <= 0
-            local cls
-            if drops[ek] and not reverse then
-                cls = "drop"
-            elseif isFight then
-                cls = "fight"
-            else
-                cls = HeatBucket((Heat(a) + Heat(b)) / 2)
-            end
+        if not edges[b .. ">" .. a] or a < b then
             n = n + 1
-            seg.a[n], seg.b[n], seg.cls[n], seg.fight[n] = a, b, cls, isFight
-            seg.x1[n], seg.y1[n] = ns.CellPos(w, a)
-            seg.x2[n], seg.y2[n] = ns.CellPos(w, b)
+            seg.a[n], seg.b[n] = a, b
+            seg.cls[n], seg.fight[n] = Classify(w, ek, a, b, heatCache)
         end
     end
     seg.n = n
     cache[inst] = seg
     return seg
+end
+
+-- Douglas-Peucker on parallel x/y arrays; returns the kept indices in order.
+local function Simplify(xs, ys, tol)
+    local n = #xs
+    if n <= 2 then return {1, n} end
+    local keep = {[1] = true, [n] = true}
+    local stack = {1, n}
+    local tol2 = tol * tol
+    while #stack > 0 do
+        local last = stack[#stack]; stack[#stack] = nil
+        local first = stack[#stack]; stack[#stack] = nil
+        local x1, y1, x2, y2 = xs[first], ys[first], xs[last], ys[last]
+        local dx, dy = x2 - x1, y2 - y1
+        local len2 = dx * dx + dy * dy
+        local worst, worstD = nil, tol2
+        for i = first + 1, last - 1 do
+            local px, py = xs[i] - x1, ys[i] - y1
+            local d
+            if len2 == 0 then
+                d = px * px + py * py
+            else
+                local cross = px * dy - py * dx
+                d = cross * cross / len2
+            end
+            if d > worstD then worst, worstD = i, d end
+        end
+        if worst then
+            keep[worst] = true
+            stack[#stack + 1] = first; stack[#stack + 1] = worst
+            stack[#stack + 1] = worst; stack[#stack + 1] = last
+        end
+    end
+    local out = {}
+    for i = 1, n do if keep[i] then out[#out + 1] = i end end
+    return out
+end
+
+-- Joins the segments for which include(i) is true into chains of the same colour (also across
+-- junctions: a polyline may branch off later), simplifies them with tolerance `tol` in the units
+-- of Pos(cellKey) -> x, y, and calls emit(xs, ys, keptIndices, cls) per chain.
+-- emit may return false to stop.
+function ns.Polylines(seg, include, Pos, tol, emit)
+    local ea, eb, ecls, eused = {}, {}, {}, {}
+    local adj = {}   -- adj[cls][node] = {edge indices}
+    local n = 0
+    for i = 1, seg.n do
+        if include(i) then
+            local a, b, cls = seg.a[i], seg.b[i], seg.cls[i]
+            n = n + 1
+            ea[n], eb[n], ecls[n] = a, b, cls
+            local byNode = adj[cls]
+            if not byNode then byNode = {}; adj[cls] = byNode end
+            local la = byNode[a]; if not la then la = {}; byNode[a] = la end
+            local lb = byNode[b]; if not lb then lb = {}; byNode[b] = lb end
+            la[#la + 1] = n
+            lb[#lb + 1] = n
+        end
+    end
+
+    -- Follow a chain from `node` through any not-yet-used connection of the same colour.
+    local function Extend(chain, node, cls)
+        local byNode = adj[cls]
+        while true do
+            local list = byNode[node]
+            local nxt
+            if list then
+                for k = 1, #list do
+                    local e = list[k]
+                    if not eused[e] then nxt = e; break end
+                end
+            end
+            if not nxt then return end
+            eused[nxt] = true
+            node = ea[nxt] == node and eb[nxt] or ea[nxt]
+            chain[#chain + 1] = node
+        end
+    end
+
+    for i = 1, n do
+        if not eused[i] then
+            eused[i] = true
+            local cls = ecls[i]
+            local fwd = {ea[i], eb[i]}
+            Extend(fwd, eb[i], cls)
+            local back = {}
+            Extend(back, ea[i], cls)
+            -- chain = reverse(back) .. fwd
+            local xs, ys = {}, {}
+            for j = #back, 1, -1 do
+                local x, y = Pos(back[j]); xs[#xs + 1] = x; ys[#ys + 1] = y
+            end
+            for j = 1, #fwd do
+                local x, y = Pos(fwd[j]); xs[#xs + 1] = x; ys[#ys + 1] = y
+            end
+            if emit(xs, ys, Simplify(xs, ys, tol), cls) == false then return end
+        end
+    end
 end

@@ -2,9 +2,12 @@
 -- world map. Follows minimap zoom, indoor/outdoor scale and "rotate minimap". Lines are
 -- clipped at the minimap's edge (round, or square when an addon makes the minimap square).
 --
--- Performance: segments are put in a spatial index (BUCKET-yard squares), so each update only
--- looks at the ones near the player. Lines are only moved when the picture actually changes
--- (moved half a pixel, turned, zoomed), at most UPDATE_RATE times a second.
+-- Performance (the minimap is drawn while you play, so this must never hitch):
+--  * The full picture is built only on login, a new continent, a new map mode or a wipe:
+--    connections are joined into chains and simplified, so a straight road is one line.
+--  * Newly walked connections are added one by one (ns.OnNewEdge), no rebuild.
+--  * Pieces sit in a spatial index (BUCKET-yard squares); an update only looks at those near
+--    the player, and only when the picture changed (moved half a pixel, turned, zoomed).
 
 local ADDON, ns = ...
 local HBD = LibStub("HereBeDragons-2.0")
@@ -12,10 +15,11 @@ local HBD = LibStub("HereBeDragons-2.0")
 local THICKNESS = 2          -- line width in minimap units (~pixels)
 local MAX_LINES = 3000
 local BUCKET = 64            -- spatial index square size in yards
-local REBUILD_INTERVAL = 3   -- seconds: pick up newly walked paths at most this often
+local SIMPLIFY = 0.75        -- max deviation in yards when simplifying chains
 local UPDATE_RATE = 30       -- max redraws per second
 local MOVE_PIXELS = 0.5      -- redraw when the player moved this many minimap pixels
 local EDGE = 0.95            -- clip at this fraction of the radius, just inside the border
+local HOLE = 9               -- no lines within this many minimap units of the player arrow
 
 -- Diameter of the minimap in yards per zoom level, for clients without C_Minimap.GetViewRadius.
 local MINIMAP_SIZE = {
@@ -23,45 +27,83 @@ local MINIMAP_SIZE = {
     outdoor = {[0] = 466 + 2 / 3, 400, 333 + 1 / 3, 266 + 2 / 3, 200, 133 + 1 / 3},
 }
 
-local floor, sqrt, sin, cos, abs, huge = math.floor, math.sqrt, math.sin, math.cos, math.abs, math.huge
+local floor, sqrt, sin, cos, abs, min, max = math.floor, math.sqrt, math.sin, math.cos, math.abs, math.min, math.max
 
 local overlay
 local lines, used = {}, 0
 
--- Spatial index: buckets[key] = {segment indices}
-local index, indexSeg, indexInst, indexMode, indexRev
-local sinceRebuild, sinceUpdate = 0, 0
-local lastX, lastY, lastFacing, lastRadius, lastWidth, lastSquare, drawnIndex
+-- Drawn pieces (world yards) and the spatial index: buckets[key] = {piece indices}
+local px1, py1, px2, py2, pcls, stamp = {}, {}, {}, {}, {}, {}
+local pn = 0
+local buckets = {}
+local drawId = 0
+local indexInst, indexW, indexMode
+local dirty = true
+local sinceUpdate = 0
+local lastX, lastY, lastFacing, lastRadius, lastWidth, lastSquare
 
 local function BucketKey(bx, by)
     return (bx + 50000) * 100000 + (by + 50000)
 end
 
-local function Rebuild(inst)
-    sinceRebuild = 0
-    indexInst, indexMode, indexRev = inst, PadvinderDB.mapMode, ns.rev
-    index = {}
-    indexSeg = ns.Segments(inst)
-    local seg = indexSeg
-    if not seg then return end
-    local mode = indexMode
-    for i = 1, seg.n do
-        if ns.InMode(seg.fight[i], mode) then
-            local k = BucketKey(floor((seg.x1[i] + seg.x2[i]) / 2 / BUCKET),
-                floor((seg.y1[i] + seg.y2[i]) / 2 / BUCKET))
-            local list = index[k]
-            if not list then list = {}; index[k] = list end
-            list[#list + 1] = i
+local function AddPiece(x1, y1, x2, y2, cls)
+    pn = pn + 1
+    px1[pn], py1[pn], px2[pn], py2[pn], pcls[pn] = x1, y1, x2, y2, cls
+    for bx = floor(min(x1, x2) / BUCKET), floor(max(x1, x2) / BUCKET) do
+        for by = floor(min(y1, y2) / BUCKET), floor(max(y1, y2) / BUCKET) do
+            local k = BucketKey(bx, by)
+            local list = buckets[k]
+            if not list then list = {}; buckets[k] = list end
+            list[#list + 1] = pn
         end
     end
 end
 
-local function Acquire()
+local function Rebuild(inst)
+    indexInst, indexMode = inst, PadvinderDB.mapMode
+    indexW = PadvinderDB.worlds[inst]
+    px1, py1, px2, py2, pcls, stamp = {}, {}, {}, {}, {}, {}
+    pn, buckets = 0, {}
+    dirty = true
+    local w = indexW
+    local seg = w and ns.Segments(inst)
+    if not seg then return end
+    local mode = indexMode
+    ns.Polylines(seg,
+        function(i) return ns.InMode(seg.fight[i], mode) end,
+        function(key) return ns.CellPos(w, key) end,
+        SIMPLIFY,
+        function(xs, ys, idx, cls)
+            for j = 1, #idx - 1 do
+                local s, e = idx[j], idx[j + 1]
+                AddPiece(xs[s], ys[s], xs[e], ys[e], cls)
+            end
+        end)
+end
+
+-- Called by the recorder after it stored a step a -> b (edge key ek) in world w.
+function ns.OnNewEdge(inst, w, ek, a, b)
+    if inst ~= indexInst or w ~= indexW then return end   -- a rebuild is coming anyway
+    if w.edges[ek] ~= 1 or w.edges[b .. ">" .. a] then return end   -- already drawn
+    local cls, isFight = ns.ClassifyEdge(w, ek)
+    if not ns.InMode(isFight, indexMode) then return end
+    local x1, y1 = ns.CellPos(w, a)
+    local x2, y2 = ns.CellPos(w, b)
+    AddPiece(x1, y1, x2, y2, cls)
+    dirty = true
+end
+
+local function Acquire(cls)
     used = used + 1
     local line = lines[used]
     if not line then
         line = overlay:CreateLine(nil, "ARTWORK")
+        line:SetThickness(THICKNESS)
         lines[used] = line
+    end
+    if line.padCls ~= cls then
+        line.padCls = cls
+        line:SetColorTexture(ns.ClassColor(cls))
     end
     line:Show()
     return line
@@ -95,7 +137,7 @@ end
 
 -- Clip segment to the square [-r, r] x [-r, r] (Liang-Barsky).
 local t0, t1
-local function ClipEdge(p, q)   -- one Liang-Barsky boundary; false = fully outside
+local function ClipEdge(p, q)   -- one boundary; false = fully outside
     if p == 0 then return q >= 0 end
     local t = q / p
     if p < 0 then
@@ -117,42 +159,64 @@ local function ClipSquare(x1, y1, x2, y2, r)
     return nil
 end
 
+local function DrawLine(cls, x1, y1, x2, y2)
+    if used >= MAX_LINES then return end
+    local line = Acquire(cls)
+    line:SetStartPoint("CENTER", overlay, x1, y1)
+    line:SetEndPoint("CENTER", overlay, x2, y2)
+end
+
+-- Draw a segment, leaving out the part within radius r of the centre: the player arrow is
+-- part of the minimap itself, so addon lines always cover it. A hole keeps it visible.
+local function DrawWithHole(cls, x1, y1, x2, y2, r)
+    local dx, dy = x2 - x1, y2 - y1
+    local a = dx * dx + dy * dy
+    local c = x1 * x1 + y1 * y1 - r * r
+    local b = 2 * (x1 * dx + y1 * dy)
+    local disc = b * b - 4 * a * c
+    if a == 0 or disc <= 0 then
+        if c > 0 then DrawLine(cls, x1, y1, x2, y2) end
+        return
+    end
+    disc = sqrt(disc)
+    local h0, h1 = (-b - disc) / (2 * a), (-b + disc) / (2 * a)
+    if h1 <= 0 or h0 >= 1 then
+        DrawLine(cls, x1, y1, x2, y2)
+        return
+    end
+    if h0 > 0 then DrawLine(cls, x1, y1, x1 + h0 * dx, y1 + h0 * dy) end
+    if h1 < 1 then DrawLine(cls, x1 + h1 * dx, y1 + h1 * dy, x2, y2) end
+end
+
 local function Draw(x, y, radius, halfWidth, facing, square)
     used = 0
-    local seg = indexSeg
+    drawId = drawId + 1
     local scale = halfWidth / radius             -- minimap units per yard
     local clipR = halfWidth * EDGE
     local Clip = square and ClipSquare or ClipCircle
     local rotate = facing ~= 0
     local fs, fc = sin(facing), cos(facing)
 
-    -- buckets that can hold visible segments (corners of a square map reach radius * sqrt 2)
-    local reach = radius * (square and 1.42 or 1) + BUCKET
-    local bx0, bx1 = floor((x - reach) / BUCKET), floor((x + reach) / BUCKET)
-    local by0, by1 = floor((y - reach) / BUCKET), floor((y + reach) / BUCKET)
-
-    local xs1, ys1, xs2, ys2, cls = seg.x1, seg.y1, seg.x2, seg.y2, seg.cls
-    for bx = bx0, bx1 do
-        for by = by0, by1 do
-            local list = index[BucketKey(bx, by)]
+    -- buckets that can hold visible pieces (corners of a square map reach radius * sqrt 2)
+    local reach = radius * (square and 1.42 or 1)
+    for bx = floor((x - reach) / BUCKET), floor((x + reach) / BUCKET) do
+        for by = floor((y - reach) / BUCKET), floor((y + reach) / BUCKET) do
+            local list = buckets[BucketKey(bx, by)]
             if list then
                 for k = 1, #list do
                     local i = list[k]
-                    -- same maths as HereBeDragons-Pins: offset from the player, rotated with
-                    -- the minimap, x to the right, y up
-                    local ax, ay = x - xs1[i], y - ys1[i]
-                    local bx2, by2 = x - xs2[i], y - ys2[i]
-                    if rotate then
-                        ax, ay = ax * fc - ay * fs, ax * fs + ay * fc
-                        bx2, by2 = bx2 * fc - by2 * fs, bx2 * fs + by2 * fc
-                    end
-                    local sx1, sy1, sx2, sy2 = Clip(ax * scale, -ay * scale, bx2 * scale, -by2 * scale, clipR)
-                    if sx1 and used < MAX_LINES then
-                        local line = Acquire()
-                        line:SetStartPoint("CENTER", overlay, sx1, sy1)
-                        line:SetEndPoint("CENTER", overlay, sx2, sy2)
-                        line:SetThickness(THICKNESS)
-                        line:SetColorTexture(ns.ClassColor(cls[i]))
+                    if stamp[i] ~= drawId then   -- long pieces sit in several buckets
+                        stamp[i] = drawId
+                        -- same maths as HereBeDragons-Pins: offset from the player, rotated
+                        -- with the minimap, x to the right, y up
+                        local ax, ay = x - px1[i], y - py1[i]
+                        local bx2, by2 = x - px2[i], y - py2[i]
+                        if rotate then
+                            ax, ay = ax * fc - ay * fs, ax * fs + ay * fc
+                            bx2, by2 = bx2 * fc - by2 * fs, bx2 * fs + by2 * fc
+                        end
+                        local sx1, sy1, sx2, sy2 = Clip(ax * scale, -ay * scale, bx2 * scale, -by2 * scale, clipR)
+                        if sx1 then DrawWithHole(pcls[i], sx1, sy1, sx2, sy2, HOLE) end
                     end
                 end
             end
@@ -172,7 +236,6 @@ local function ViewRadius()
 end
 
 local function OnUpdate(_, elapsed)
-    sinceRebuild = sinceRebuild + elapsed
     sinceUpdate = sinceUpdate + elapsed
     if sinceUpdate < 1 / UPDATE_RATE then return end
     sinceUpdate = 0
@@ -187,13 +250,8 @@ local function OnUpdate(_, elapsed)
         return
     end
 
-    if inst ~= indexInst or PadvinderDB.mapMode ~= indexMode
-        or (indexRev ~= ns.rev and sinceRebuild >= REBUILD_INTERVAL) then
+    if inst ~= indexInst or PadvinderDB.mapMode ~= indexMode or PadvinderDB.worlds[inst] ~= indexW then
         Rebuild(inst)
-    end
-    if not indexSeg then
-        if used > 0 then HideAll() end
-        return
     end
 
     local facing = 0
@@ -209,21 +267,20 @@ local function OnUpdate(_, elapsed)
     local square = GetMinimapShape and GetMinimapShape() == "SQUARE" or false
 
     -- skip when nothing visible changed
-    if lastX and drawnIndex == index and radius == lastRadius and halfWidth == lastWidth
+    if not dirty and lastX and radius == lastRadius and halfWidth == lastWidth
         and square == lastSquare and abs(facing - lastFacing) < 0.005 then
         local dx, dy = x - lastX, y - lastY
         if sqrt(dx * dx + dy * dy) * halfWidth / radius < MOVE_PIXELS then return end
     end
-    lastX, lastY, lastFacing, lastRadius, lastWidth, lastSquare, drawnIndex =
-        x, y, facing, radius, halfWidth, square, index
+    lastX, lastY, lastFacing, lastRadius, lastWidth, lastSquare = x, y, facing, radius, halfWidth, square
+    dirty = false
 
     Draw(x, y, radius, halfWidth, facing, square)
 end
 
--- Force a redraw on the next update (e.g. after turning minimap paths on).
+-- Rebuild and redraw on the next update (e.g. after turning minimap paths on).
 function ns.RefreshMinimap()
     indexInst = nil
-    lastX = nil
 end
 
 function ns.InitMinimap()

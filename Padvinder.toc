@@ -2,7 +2,7 @@
 ## Title: Padvinder
 ## Notes: Records the paths you walk and draws them as a heatmap on the world map and minimap.
 ## Author: Neil & Claude
-## Version: 0.4.0
+## Version: 0.4.1
 ## SavedVariables: PadvinderDB
 
 libs\LibStub\LibStub.lua
