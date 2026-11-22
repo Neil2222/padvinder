@@ -332,9 +332,9 @@ local function OnUpdate(_, elapsed)
         if used + routeUsed > 0 then HideAll() end
         return
     end
-    local x, y, inst = HBD:GetPlayerWorldPosition()
-    if not x or not y or not inst or (issecretvalue and (issecretvalue(x) or issecretvalue(y))) then
-        if used + routeUsed > 0 then HideAll() end
+    local x, y, inst, hidden = ns.PlayerPos()
+    if not x then
+        if not hidden and used + routeUsed > 0 then HideAll() end   -- (hidden: keep the picture)
         return
     end
 
@@ -354,11 +354,8 @@ local function OnUpdate(_, elapsed)
 
     local facing = 0
     if GetCVar("rotateMinimap") == "1" then
-        facing = GetPlayerFacing()
-        if not facing then
-            if used + routeUsed > 0 then HideAll() end
-            return
-        end
+        facing = ns.Facing()
+        if not facing then return end   -- hidden for a moment: keep the picture
     end
     local radius = ViewRadius()
     local halfWidth = Minimap:GetWidth() / 2

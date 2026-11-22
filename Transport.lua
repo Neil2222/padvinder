@@ -108,7 +108,7 @@ end
 
 -- "New flight path discovered!": the nearest flight point is found.
 local function FoundHere()
-    local x, y, inst = HBD:GetPlayerWorldPosition()
+    local x, y, inst = ns.PlayerPos()
     if not x then return end
     local best, bestD
     for _, node in ipairs(AllNodes()) do

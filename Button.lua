@@ -45,7 +45,7 @@ local function OnTooltipShow(tooltip)
     if ns.RouteInfo then
         tooltip:AddDoubleLine("Route", ns.RouteInfo(), nil, nil, nil, 1, 1, 1)
     end
-    local _, _, inst = HBD:GetPlayerWorldPosition()
+    local _, _, inst = ns.PlayerPos()
     if inst and PadvinderDB.worlds[inst] then
         local _, _, travel, grinding = ns.Stats(inst)
         tooltip:AddDoubleLine("Travel paths", ("%.1f km"):format(travel), nil, nil, nil, 1, 1, 1)

@@ -588,7 +588,7 @@ end
 
 local function Plan()
     if not goal then return end
-    local x, y, inst = HBD:GetPlayerWorldPosition()
+    local x, y, inst = ns.PlayerPos()
     if not x then return end
     lastPlan = GetTime()
     planX, planY, planInst = x, y, inst
@@ -695,9 +695,9 @@ end
 local textElapsed = 0
 local function ArrowOnUpdate(_, elapsed)
     if not targetX then return end
-    local x, y = HBD:GetPlayerWorldPosition()
-    local facing = GetPlayerFacing()
-    if not x or not facing then return end
+    local x, y = ns.PlayerPos()
+    local facing = ns.Facing()
+    if not x or not facing then return end   -- hidden (combat): the arrow keeps its direction
     local angle = atan2(targetX - x, targetY - y) - facing
     TomTom:SetCrazyArrowDirection(angle)
     TomTom:SetCrazyArrowColor(ArrowColor(angle))
@@ -745,9 +745,9 @@ local function Update()
         Release()
         return
     end
-    local x, y, inst = HBD:GetPlayerWorldPosition()
+    local x, y, inst, hidden = ns.PlayerPos()
     if not x then
-        Release()
+        if not hidden then Release() end   -- hidden for a moment (combat): keep everything as it is
         return
     end
     local now = GetTime()

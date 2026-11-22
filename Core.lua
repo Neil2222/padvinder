@@ -33,6 +33,27 @@ local floor, sqrt = math.floor, math.sqrt
 local PREFIX = "|cff66ccffPadvinder|r: "
 function ns.Print(msg) print(PREFIX .. msg) end
 
+-- The game can hide values from addons ("secret values", e.g. during combat). Those can't be
+-- used in maths or comparisons without a Lua error, so these return nil instead.
+local function Known(v)
+    if v == nil or (issecretvalue and issecretvalue(v)) then return nil end
+    return v
+end
+ns.Known = Known
+
+-- Player position in world yards: x, y, instance. Returns nil when there is none (instances),
+-- and nil, nil, nil, true when the game hides it right now.
+function ns.PlayerPos()
+    local x, y, inst = HBD:GetPlayerWorldPosition()
+    if x == nil or y == nil or inst == nil then return nil end
+    if not Known(x) or not Known(y) or not Known(inst) then return nil, nil, nil, true end
+    return x, y, inst
+end
+
+function ns.Facing()
+    return GetPlayerFacing and Known(GetPlayerFacing())
+end
+
 local function World(inst)
     local w = PadvinderDB.worlds[inst]
     if not w then
@@ -103,10 +124,10 @@ local lastTransport = -1000
 -- Standing on a boat or zeppelin: the position moves faster than you do yourself (there is no
 -- API for "on a transport"). ns.onTransport is also used by the route planner.
 local function DetectTransport(x, y, inst, elapsed, now)
-    if tickX and inst == tickInst and elapsed > 0 and GetUnitSpeed then
+    local own = GetUnitSpeed and Known(GetUnitSpeed("player"))
+    if tickX and inst == tickInst and elapsed > 0 and own then
         local dx, dy = x - tickX, y - tickY
         local v = sqrt(dx * dx + dy * dy) / elapsed
-        local own = GetUnitSpeed("player") or 0
         if v > own + TRANSPORT_MARGIN and v < 200 then lastTransport = now end   -- (200+: teleport)
     end
     tickX, tickY, tickInst = x, y, inst
@@ -148,8 +169,8 @@ local function Start(x, y, inst)
 end
 
 local function Tick(elapsed)
-    local x, y, inst = HBD:GetPlayerWorldPosition()
-    if not x or not y or not inst or (issecretvalue and (issecretvalue(x) or issecretvalue(y))) then
+    local x, y, inst = ns.PlayerPos()
+    if not x then
         tickX = nil
         Break()
         return
