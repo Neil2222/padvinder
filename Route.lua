@@ -529,7 +529,14 @@ local WHERE = {flight = "to the flight master", boat = "to the boat", zeppelin =
 local function Release()
     if hijacked then
         hijacked = false
-        if TomTom and TomTom.ReleaseCrazyArrow then TomTom:ReleaseCrazyArrow() end
+        if TomTom and TomTom.ReleaseCrazyArrow then
+            TomTom:ReleaseCrazyArrow()
+            -- TomTom only sets the title when its target changes: put the waypoint's back
+            -- (its own update fills in the distance again).
+            if goal and TomTom.SetCrazyArrowTitle then
+                TomTom:SetCrazyArrowTitle(goal.title or "", "", "")
+            end
+        end
     end
 end
 
