@@ -1,3 +1,5 @@
+<p align="center"><img src="media/banner.png" alt="Padvinder"></p>
+
 # Padvinder
 
 A World of Warcraft addon for **WoW Forever** that records the paths you walk, draws them as a

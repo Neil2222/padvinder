@@ -8,7 +8,7 @@ local HBD = LibStub("HereBeDragons-2.0")
 local LDB = LibStub("LibDataBroker-1.1")
 local DBIcon = LibStub("LibDBIcon-1.0")
 
-local ICON = "Interface\\Icons\\INV_Misc_Map_01"
+local ICON = "Interface\\AddOns\\Padvinder\\media\\icon"
 local NEXT_VIEW = {all = "travel", travel = "grind", grind = "off", off = "all"}
 
 local dataObject
