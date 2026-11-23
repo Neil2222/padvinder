@@ -4,3 +4,4 @@
 .gitignore     export-ignore
 media/logo.png   export-ignore
 media/banner.png export-ignore
+media/social-preview.jpg export-ignore
