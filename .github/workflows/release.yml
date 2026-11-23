@@ -30,18 +30,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cat > notes.md <<NOTES
-          ## Install
-
-          1. Download **Padvinder-$GITHUB_REF_NAME.zip** below (not "Source code").
-          2. Unzip it into \`World of Warcraft\_forever_\Interface\AddOns\\` so you get \`AddOns\Padvinder\Padvinder.toc\`.
-          3. Restart the game. For the route arrow you also need [TomTom](https://www.curseforge.com/wow/addons/tomtom).
-
-          Updating: delete the old \`Padvinder\` folder first. Your recorded paths are kept. Type \`/pad\` in game for the commands.
-
-          ## Changes
-
-          NOTES
+          sed "s/VERSION/$GITHUB_REF_NAME/g" .github/release-notes.md > notes.md
+          git fetch -q --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
           git tag -l --format='%(contents)' "$GITHUB_REF_NAME" >> notes.md
           gh release create "$GITHUB_REF_NAME" "Padvinder-$GITHUB_REF_NAME.zip" \
             --title "Padvinder $GITHUB_REF_NAME" --notes-file notes.md
