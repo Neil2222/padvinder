@@ -1,16 +1,30 @@
 # Push a tag like v0.8.2 and this builds Padvinder-v0.8.2.zip (with a Padvinder/ folder inside,
-# ready to unzip into Interface\AddOns) and publishes it as a GitHub release.
+# ready to unzip into Interface\AddOns), publishes it as a GitHub release and uploads the same
+# zip to CurseForge. Run it by hand (Actions -> Release -> Run workflow) to only check that the
+# CurseForge token and game version work, without uploading anything.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  curseforge-check:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check CurseForge token and game version
+        env:
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+        run: bash .github/scripts/curseforge.sh check
+
   release:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
