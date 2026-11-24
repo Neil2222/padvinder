@@ -47,5 +47,13 @@ jobs:
           sed "s/VERSION/$GITHUB_REF_NAME/g" .github/release-notes.md > notes.md
           git fetch -q --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
           git tag -l --format='%(contents)' "$GITHUB_REF_NAME" >> notes.md
+          # Already there when this job is re-run after a failed CurseForge upload
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
           gh release create "$GITHUB_REF_NAME" "Padvinder-$GITHUB_REF_NAME.zip" \
             --title "Padvinder $GITHUB_REF_NAME" --notes-file notes.md
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > changelog.md
+
+      - name: Upload to CurseForge
+        env:
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+        run: bash .github/scripts/curseforge.sh upload "Padvinder-$GITHUB_REF_NAME.zip" "$GITHUB_REF_NAME" changelog.md
