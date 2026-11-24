@@ -32,6 +32,14 @@ a mountain, the arrow follows the paths you (and the game's NPCs) actually use.
 
 ## Installation
 
+### With an addon manager (easiest)
+
+Padvinder is on [CurseForge](https://www.curseforge.com/wow/addons/padvinder). Search for
+**Padvinder** in the CurseForge app or WowUp (with *World of Warcraft: Forever* selected) and
+click Install. Updates then come in by themselves.
+
+### By hand
+
 1. Download `Padvinder-<version>.zip` from the
    [latest release](https://github.com/Neil2222/padvinder/releases/latest)
    (the asset, **not** "Source code").
@@ -39,11 +47,13 @@ a mountain, the arrow follows the paths you (and the game's NPCs) actually use.
    ```
    World of Warcraft\_forever_\Interface\AddOns\Padvinder\Padvinder.toc
    ```
-3. Restart the game (or `/reload`) and make sure Padvinder is enabled in the AddOns list on the
-   character select screen. If it shows as "out of date", tick **Load out of date AddOns**.
+3. Restart the game and make sure Padvinder is enabled in the AddOns list on the character
+   select screen. If it shows as "out of date", tick **Load out of date AddOns**.
 
-To update: delete the old `Padvinder` folder and unzip the new one. Your recorded paths are kept
-(they are stored in `WTF\Account\...\SavedVariables\Padvinder.lua`, not in the addon folder).
+To update by hand: delete the old `Padvinder` folder and unzip the new one.
+
+Either way your recorded paths are kept when you update: they are stored in
+`WTF\Account\...\SavedVariables\Padvinder.lua`, not in the addon folder.
 
 ## Commands
 
